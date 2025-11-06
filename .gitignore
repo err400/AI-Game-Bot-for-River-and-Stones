@@ -1,0 +1,8 @@
+.DS_Store
+.vscode/
+A5.pdf
+all_theories
+build/
+*.o
+*.so
+*.dylib
