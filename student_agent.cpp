@@ -65,6 +65,24 @@ Move minimax_decision(const vector<vector<map<string, string>>>& board,const str
 int max_value(const vector<vector<map<string, string>>>& board, string owner,int max_depth,int current_depth,int alpha,int beta);
 int min_value(const vector<vector<map<string, string>>>& board, string owner,int max_depth,int current_depth,int alpha,int beta);
 bool is_terminal(const vector<vector<map<string, string>>>& board);
+// Global game context set at the start of choose(); used to avoid threading dims everywhere
+static int G_ROWS = 13;
+static int G_COLS = 12;
+static vector<int> G_SCORE_COLS;
+
+static inline int top_score_row_dynamic(){ return 2; }
+static inline int bottom_score_row_dynamic(){ return G_ROWS - 3; }
+static inline bool col_in_score(int c){
+    return find(G_SCORE_COLS.begin(), G_SCORE_COLS.end(), c) != G_SCORE_COLS.end();
+}
+static inline bool is_own_score_cell_dyn(int r,int c,const string& owner){
+    if(owner=="circle") return (r==top_score_row_dynamic()) && col_in_score(c);
+    return (r==bottom_score_row_dynamic()) && col_in_score(c);
+}
+static inline bool is_opponent_score_cell_dyn(int r,int c,const string& owner){
+    if(owner=="circle") return (r==bottom_score_row_dynamic()) && col_in_score(c);
+    return (r==top_score_row_dynamic()) && col_in_score(c);
+}
 bool is_in_score_area(int row,int column,string owner);
 
 // River flow safety check: returns true if flipping/rotating a river at (r,c)
@@ -107,7 +125,7 @@ static bool allows_flow_into_opponent_score_after_orientation(
             while(inb(nx,ny)){
                 // If an empty cell in opponent's scoring area is reachable by flow, unsafe
                 if (board[nx][ny].empty()){
-                    if (is_in_score_area(nx, ny, owner)){
+                    if (is_opponent_score_cell_dyn(nx, ny, owner)){
                         return true; // allows flow into opponent score => unsafe
                     }
                     nx += dx; ny += dy; // continue sliding
@@ -138,20 +156,12 @@ Move find_path_blocking_moves(const vector<vector<map<string, string>>>& board, 
 
 //this function determines teh minimum distnace from the score area
 int min_distance_from_scoring_area(const string& owner,int x,int y){
-    int owner_x;
-    vector<int> v = {4,5,6,7};
-    if(owner == "circle"){
-        owner_x = 2;
+    int target_row = (owner=="circle") ? top_score_row_dynamic() : bottom_score_row_dynamic();
+    int best = 100;
+    for(int sc : G_SCORE_COLS){
+        best = min(best, abs(x - target_row) + abs(y - sc));
     }
-    else{
-        owner_x = 10;
-    }
-    int min_dist = 100;
-    for(auto owner_y:v){
-        int dist = abs(x - owner_x) + abs(y - owner_y);
-        min_dist = min(min_dist, dist);
-    }
-    return min_dist;
+    return best;
 }
 
 //determines the path through the next river to get the shortest distanve it ca approach to the final score area 
@@ -210,14 +220,12 @@ static pair<int,int> pick_spearhead_stone(const vector<vector<map<string,string>
 //and if it is less than a  certain amount then decalring it as threat (self and opp)
 vector<int> manhattan_distance(const vector<vector<map<string,string>>>& board,const string& owner,const map<pair<int,int>,vector<Move>>& moves){
     const int n = board.size(), m = board[0].size();
-    const int circle_target = 2, square_target = 10;
-
-    auto goal_row = [&](const string& who){ return (who=="circle") ? circle_target : square_target;};
+    auto goal_row = [&](const string& who){ return (who=="circle") ? top_score_row_dynamic() : bottom_score_row_dynamic();};
     
     //calculating manhattan distance
     auto MD = [&](const string& who,int i,int j){
         int g = goal_row(who),best = 100;
-        for(int sc=4; sc<=7; ++sc)best = min(best,abs(i-g) + abs(j-sc));
+        for(int sc : G_SCORE_COLS) best = min(best, abs(i-g) + abs(j-sc));
         return best;
     };
     
@@ -267,51 +275,21 @@ vector<int> manhattan_distance(const vector<vector<map<string,string>>>& board,c
 
 //check for number of stones in score area 
 int count_in_score_area(const vector<vector<map<string, string>>>& board,string owner){
-    //defines acore area 
-    vector<pair<int, int>> circle_score_area = { {2,4}, {2,5}, {2,6}, {2,7} }; 
-    vector<pair<int, int>> square_score_area = { {10,4}, {10,5}, {10,6}, {10,7} }; 
-   //checking presence in their respective areas
-    if(owner=="circle"){
-        int count_circle = 0;
-        for(const auto& pos : circle_score_area){
-            if(!board[pos.first][pos.second].empty() && board[pos.first][pos.second].at("side")=="stone"&& board[pos.first][pos.second].at("owner") == "circle"){
-                count_circle++;
-            }
+    int r = (owner=="circle") ? top_score_row_dynamic() : bottom_score_row_dynamic();
+    int cnt = 0;
+    for(int c : G_SCORE_COLS){
+        if(r>=0 && r<G_ROWS && c>=0 && c<G_COLS){
+            const auto& cell = board[r][c];
+            if(!cell.empty() && cell.at("owner")==owner && cell.at("side")=="stone") cnt++;
         }
-        return count_circle;
     }
-    else{
-        int count_square = 0;
-        for(const auto& pos : square_score_area){
-            if(!board[pos.first][pos.second].empty() && board[pos.first][pos.second].at("side")=="stone" && board[pos.first][pos.second].at("owner")=="square"){
-                count_square++;
-            }
-        }
-        return count_square;
-    }
+    return cnt;
 }
 
 //for checking if the stone was going to enter the scorign area of opposition  
 bool is_in_score_area(int row,int col,string owner){
-
-    vector<pair<int, int>> circle_score_area = { {2,4}, {2,5}, {2,6}, {2,7} }; 
-    vector<pair<int, int>> square_score_area = { {10,4}, {10,5}, {10,6}, {10,7} }; 
-   
-    if(owner=="circle"){
-        for(const auto& pos : square_score_area){
-            if(row == pos.first && col == pos.second){
-                return true;
-            }
-        }
-    }
-    else{
-        for(const auto& pos : circle_score_area){
-            if(row ==pos.first && col==pos.second){
-                return true;
-            }
-        }
-    }
-    return false;
+    // Historical name: this checks opponent's scoring area
+    return is_opponent_score_cell_dyn(row, col, owner);
 }
 
 
@@ -338,7 +316,7 @@ void explore_river_move(const vector<vector<map<string, string>>>& board,int x, 
             if (nx == from_row && ny == from_col) { nx += dx; ny += dy; continue;}
 
             if (board[nx][ny].empty()){
-                if (!is_in_score_area(nx, ny, owner)) {
+                if (!is_opponent_score_cell_dyn(nx, ny, owner)) {
                     moves.push_back({"move", {from_row, from_col}, {nx, ny}, {}, ""});
                 }
             } 
@@ -384,7 +362,7 @@ void explore_river_push(const vector<vector<map<string, string>>>& board,int pus
             }
 
             if(board[nx][ny].empty()){
-                if(!is_in_score_area(nx, ny, owner_to_be_pushed)){
+                if(!is_opponent_score_cell_dyn(nx, ny, owner_to_be_pushed)){
                  // empty thus a possible move position
                     moves.push_back({"push",{or_from_row, or_from_col},{or_push_row, or_push_col},{nx, ny},""});
                 }
@@ -430,7 +408,7 @@ vector<Move>generate_all_moves(const vector<vector<map<string, string>>>& board,
         int nx = row + dx, ny = col + dy;
         if (nx < 0 || nx >= rows || ny < 0 || ny >= cols) continue;
         //checking if it is going in opponents score area
-        if(is_in_score_area(nx,ny,owner)){
+        if(is_opponent_score_cell_dyn(nx,ny,owner)){
             continue;
         }
         if(board[nx][ny].empty()){
@@ -450,7 +428,7 @@ vector<Move>generate_all_moves(const vector<vector<map<string, string>>>& board,
         int nx2 = row + 2*dx;
         int ny2 = col + 2*dy;
         if(nx < 0 || nx >= rows || ny < 0 || ny >= cols) continue;
-        if(is_in_score_area(nx,ny,owner)) continue;
+        if(is_opponent_score_cell_dyn(nx,ny,owner)) continue;
         if(board[nx][ny].empty()) continue;
         if(board[nx][ny].at("side")!="stone") continue;
 
@@ -459,7 +437,7 @@ vector<Move>generate_all_moves(const vector<vector<map<string, string>>>& board,
 
             // Skip invalid destination
             if(nx2 < 0 || nx2 >= rows || ny2 < 0 || ny2 >= cols)continue;
-            if(is_in_score_area(nx2, ny2, owner_to_be_pushed))continue;
+            if(is_opponent_score_cell_dyn(nx2, ny2, owner_to_be_pushed))continue;
             if(!board[nx2][ny2].empty())continue;
 
             //  stone push
@@ -504,29 +482,24 @@ vector<Move>generate_all_moves(const vector<vector<map<string, string>>>& board,
 
 //checking if any one of the palyer has one and thus recognizing the terminal node
 bool is_terminal(const vector<vector<map<string, string>>>& board){
-   
-    vector<pair<int, int>>circle_score_area = {{2,4},{2,5},{2,6},{2,7}};
-    vector<pair<int, int>>square_score_area = {{10,4},{10,5},{10,6},{10,7}};
-
-    int circle_stones = 0,square_stones = 0;
-
-    //counting the number of circles stones in their area
-    for(const auto& pos : circle_score_area){
-        const auto& cell = board[pos.first][pos.second];
-        if(!cell.empty() && cell.at("owner") == "circle" && cell.at("side") == "stone"){
-                circle_stones++;
+    int circle_row = top_score_row_dynamic();
+    int square_row = bottom_score_row_dynamic();
+    auto win_needed = [&](int cols){ if(cols<=12) return 4; else if(cols<=14) return 5; else return 6; };
+    int need = win_needed(G_COLS);
+    int circle_stones = 0, square_stones = 0;
+    for(int c : G_SCORE_COLS){
+        if(circle_row>=0 && circle_row<G_ROWS && c>=0 && c<G_COLS){
+            const auto& cell = board[circle_row][c];
+            if(!cell.empty() && cell.at("owner")=="circle" && cell.at("side")=="stone") circle_stones++;
         }
-    }
-    //counting the number of square stones in their area
-    for(const auto& pos:square_score_area){
-        const auto& cell = board[pos.first][pos.second];
-        if(!cell.empty() && cell.at("owner")=="square" && cell.at("side") == "stone"){
-                square_stones++;
+        if(square_row>=0 && square_row<G_ROWS && c>=0 && c<G_COLS){
+            const auto& cell2 = board[square_row][c];
+            if(!cell2.empty() && cell2.at("owner")=="square" && cell2.at("side")=="stone") square_stones++;
         }
     }
 
     // Terminal if either player has all 4 stones in their score area
-    if(circle_stones == 4 || square_stones == 4)return true;
+    if(circle_stones >= need || square_stones >= need)return true;
 
     return false;
 }
@@ -734,7 +707,9 @@ Move check_for_instant_win(const vector<vector<map<string, string>>>& board,stri
             vector<Move>current_move = moves[make_pair(i,j)];
             for(auto it: current_move){
                 vector<vector<map<string, string>>>updated = update_board(board,it);
-                if(count_in_score_area(updated,owner)==4){
+                // dynamic win target by board width
+                int need = (G_COLS<=12)?4:((G_COLS<=14)?5:6);
+                if(count_in_score_area(updated,owner)>=need){
                     return it;
                 }
             }
@@ -956,6 +931,8 @@ public:
     explicit StudentAgent(string side) : side(std::move(side)), gen(rd()){}
 
     Move choose(const vector<vector<map<string, string>>>& board,int row,int col,const vector<int>& score_cols,float current_player_time,float opponent_time){
+        // Set global context for dynamic scoring helpers
+        G_ROWS = row; G_COLS = col; G_SCORE_COLS = score_cols;
         // it is getting all moves together for the given state of board will help later
         map<pair<int,int>,vector<Move>> moves_for_current;
         int n= board.size();
@@ -989,7 +966,8 @@ public:
         // Iterative deepening with time control
         auto start_time = chrono::high_resolution_clock::now();
         // Dynamic time budget: be aggressive when we have time, conservative when low
-        double time_limit = std::max(0.05, std::min(0.6, (double)current_player_time / 30.0));
+        // Use a 0.5–0.8s budget based on remaining time (anytime)
+        double time_limit = 0.5 + 0.3 * std::min(1.0, std::max(0.0, (double)current_player_time / 20.0));
         
         // Start with minimal depth
         int depth = 1;
@@ -1287,44 +1265,32 @@ int river_synergy(const std::vector<std::vector<std::map<std::string, std::strin
 //computing the n self and n opp and returning its differncve , it is numbe rof stones in scor area 
 
 pair<int,int> compute_n_self_opp(const std::vector<std::vector<std::map<std::string, std::string>>>& board,const string& owner){
-    int n = board.size();
-    int m = board[0].size();
-    string opponent = (owner == "circle") ? "square" : "circle";
-    int num_circle = 0;
-    int num_square = 0;
-    std::vector<std::pair<int, int>> circle_score_area = { {2,4}, {2,5}, {2,6}, {2,7} };
-    std::vector<std::pair<int, int>> square_score_area = { {10,4}, {10,5}, {10,6}, {10,7} };
-    
-    for(const auto& pos : circle_score_area){
-        const auto& cell = board[pos.first][pos.second];
-        if(!cell.empty() && cell.at("owner") == "circle" && cell.at("side") == "stone"){
-            num_circle++;
+    (void)board; // dims read from globals
+    int circle_row = top_score_row_dynamic();
+    int square_row = bottom_score_row_dynamic();
+    int num_circle = 0, num_square = 0;
+    for(int c : G_SCORE_COLS){
+        if(circle_row>=0 && circle_row<G_ROWS && c>=0 && c<G_COLS){
+            const auto& cell = board[circle_row][c];
+            if(!cell.empty() && cell.at("owner")=="circle" && cell.at("side")=="stone") num_circle++;
+        }
+        if(square_row>=0 && square_row<G_ROWS && c>=0 && c<G_COLS){
+            const auto& cell2 = board[square_row][c];
+            if(!cell2.empty() && cell2.at("owner")=="square" && cell2.at("side")=="stone") num_square++;
         }
     }
-    
-    for(const auto& pos : square_score_area){
-        const auto& cell = board[pos.first][pos.second];
-        if(!cell.empty() && cell.at("owner") == "square" && cell.at("side") == "stone"){
-            num_square++;
-        }
-    }
-    
-    // Determine own vs opponent score count
-    int n_self = (owner == "circle") ? num_circle : num_square;
-    int n_opp = (owner == "circle") ? num_square : num_circle;
-
-    return make_pair(n_self, n_opp);
+    int n_self = (owner=="circle") ? num_circle : num_square;
+    int n_opp  = (owner=="circle") ? num_square : num_circle;
+    return {n_self, n_opp};
 }
 
 //computing m self  where i get the improvemnt after one move 
 //that is the number of stones in score area increases
 int compute_m_self(const std::vector<std::vector<std::map<std::string, std::string>>>& board,const string& owner,const map<pair<int,int>,vector<Move>>& moves){
-
-
-    std::vector<std::pair<int, int>>circle_score_area = { {2,4},{2,5}, {2,6}, {2,7}};
-    std::vector<std::pair<int, int>>square_score_area = { {10,4},{10,5},{10,6}, {10,7}};
-    //getting which score area to chcek 
-    auto& score_area = (owner == "circle") ? circle_score_area : square_score_area;
+    // Build dynamic score area cells for this owner
+    vector<pair<int,int>> score_area;
+    int r = (owner=="circle") ? top_score_row_dynamic() : bottom_score_row_dynamic();
+    for(int c : G_SCORE_COLS) score_area.push_back({r,c});
     
     int n = board.size();
     int m = board[0].size();
@@ -1339,16 +1305,17 @@ int compute_m_self(const std::vector<std::vector<std::map<std::string, std::stri
    
     //adding score bonuses based on waht state we already had 
     int score_bonus = 0;
-    if(current_stones_in_score == 1){
+    int need = (G_COLS<=12)?4:((G_COLS<=14)?5:6);
+    if(current_stones_in_score == max(1, need-3)){
         score_bonus = 1000;
     }
-    else if(current_stones_in_score == 2){
+    else if(current_stones_in_score == max(2, need-2)){
         score_bonus = 3000;
     }
-    else if(current_stones_in_score == 3){
+    else if(current_stones_in_score == max(3, need-1)){
         score_bonus = 8000;
     }
-    else if(current_stones_in_score == 4){
+    else if(current_stones_in_score >= need){
         score_bonus = 1000000;
     }
 
@@ -1465,8 +1432,7 @@ int evaluate_function(const std::vector<std::vector<std::map<std::string, std::s
     int weight_oppbest    = 150; 
 
     auto in_own_score = [&](const string& who, int x, int y){
-        if (who=="circle") return (x==2  && y>=4 && y<=7);
-        else               return (x==10 && y>=4 && y<=7);
+        return is_own_score_cell_dyn(x,y,who);
     };
 
     // Optional flip penalty: discourage flipping unless it creates value.
@@ -1516,7 +1482,7 @@ int evaluate_function(const std::vector<std::vector<std::map<std::string, std::s
                 for (int sc=4; sc<=7; ++sc) best = min(best, abs(i-grow) + abs(j-sc));
                 return best;
             };
-            int goal_row = (opponent=="circle") ? 2 : 10;
+            int goal_row = (opponent=="circle") ? top_score_row_dynamic() : bottom_score_row_dynamic();
             int bfs_dist = MD(goal_row);
             int cost;
             if (board[i][j].at("side")=="stone"){
@@ -1547,8 +1513,8 @@ int evaluate_function(const std::vector<std::vector<std::map<std::string, std::s
 
     // lane analysis
     auto inside = [&](int x,int y){ return 0<=x && x<n && 0<=y && y<m; };
-    int goal_row = (owner=="circle") ? 2 : 10;
-    int start_row = (owner=="circle") ? 10 : 2;          
+    int goal_row = (owner=="circle") ? top_score_row_dynamic() : bottom_score_row_dynamic();
+    int start_row = (owner=="circle") ? bottom_score_row_dynamic() : top_score_row_dynamic();
     int step      = (owner=="circle") ? -1  : +1;
 
     // Count blockers in a column, but distinguish between stones and rivers
@@ -1774,7 +1740,7 @@ int evaluate_function(const std::vector<std::vector<std::map<std::string, std::s
             if (board[r][c].at("owner") == owner){
                 // Manhattan to *your* scoring row (you already have this helper)
                 int dist = min_distance_from_scoring_area(owner, r, c);
-                if (is_in_score_area(r, c, owner)) ++in_score_self;
+                if (is_own_score_cell_dyn(r, c, owner)) ++in_score_self;
                 else if (dist == 1) ++near1_self;
                 else if (dist <= 2) ++near2_self;
                 else if (dist <= 4) ++near4_self;
@@ -1785,7 +1751,7 @@ int evaluate_function(const std::vector<std::vector<std::map<std::string, std::s
             } 
             else { // opponent stone
                 int dist = min_distance_from_scoring_area(opp, r, c);
-                if (is_in_score_area(r, c, opp)) ++in_score_opp;
+                if (is_own_score_cell_dyn(r, c, opp)) ++in_score_opp;
                 else if (dist == 1) ++near1_opp;
                 else if (dist <= 2) ++near2_opp;
                 else if (dist <= 4) ++near4_opp;
@@ -1824,14 +1790,17 @@ int evaluate_function(const std::vector<std::vector<std::map<std::string, std::s
     // pulling stones that are close in rows toward scoring columns (4..7)
     auto nearest_scoring_col_dist = [&](const string& pov, int /*r*/, int c){
         int best = 100;
-        for(int sc=4; sc<=7; ++sc) best = min(best, abs(sc - c));
+        for(int sc : G_SCORE_COLS) best = min(best, abs(sc - c));
         return best; // 0 means already in a scoring column
     };
     auto row_gap_to_goal = [&](const string& pov, int r){
-        return abs(r - ((pov=="circle")? 2 : 10));
+        return abs(r - ((pov=="circle")? top_score_row_dynamic() : bottom_score_row_dynamic()));
     };
 
     int side_pull_self = 0, side_pull_opp = 0;
+    int col_width = (int)G_SCORE_COLS.size();
+    int cap1 = max(1, col_width);      // like 4 in 12x board
+    int cap2 = max(1, col_width/2);    // like 2 in 12x board
 
     for(int r=0; r<n; ++r){
         for(int c=0; c<m; ++c){
@@ -1842,13 +1811,13 @@ int evaluate_function(const std::vector<std::vector<std::map<std::string, std::s
                 if (rd <= 2){
                     int cd = nearest_scoring_col_dist(owner, r, c);
                     // stronger when just 1 row away
-                    side_pull_self += (rd==1 ? (4 - cd) : (2 - cd));
+                    side_pull_self += (rd==1 ? (cap1 - cd) : (cap2 - cd));
                 }
             } else {
                 int rd = row_gap_to_goal(opp, r);
                 if (rd <= 2){
                     int cd = nearest_scoring_col_dist(opp, r, c);
-                    side_pull_opp += (rd==1 ? (4 - cd) : (2 - cd));
+                    side_pull_opp += (rd==1 ? (cap1 - cd) : (cap2 - cd));
                 }
             }
         }
@@ -1867,12 +1836,12 @@ int evaluate_function(const std::vector<std::vector<std::map<std::string, std::s
             if (itmv == all_moves.end()) continue;
             for (const auto& mv : itmv->second){
                 if (mv.action=="move"){
-                    if (who==owner && is_in_score_area(mv.to[0], mv.to[1], owner)){
+                    if (who==owner && is_opponent_score_cell_dyn(mv.to[0], mv.to[1], owner)){
                         ++finish_now_self; break;
                     }
                     if (who!=owner){
                         string oppo = (owner=="circle")? "square":"circle";
-                        if (is_in_score_area(mv.to[0], mv.to[1], oppo)){
+                        if (is_opponent_score_cell_dyn(mv.to[0], mv.to[1], oppo)){
                             ++finish_now_opp; break;
                         }
                     }
