@@ -238,6 +238,120 @@ static int evaluate_function(const vector<vector<map<string, string>>>& board, c
     return 3000*(self_n - opp_n);
 }
 
+// ---------- Quick heuristics for priors ----------
+// Manhattan distance to own scoring area (row distance + nearest scoring column distance)
+static inline int mdist_to_own_score(const string& owner, int r, int c){
+    int target_row = (owner=="circle") ? top_score_row_dynamic() : bottom_score_row_dynamic();
+    int row_d = abs(r - target_row);
+    int col_d = 1000000;
+    for(int sc : G_SCORE_COLS){ col_d = min(col_d, abs(c - sc)); }
+    return row_d + (col_d>=1000000?0:col_d);
+}
+
+// Move-centric progress delta for priors: positive means progress for mover side
+static double move_progress_delta_for(const vector<vector<map<string,string>>>& board,
+                                      const Move& mv,
+                                      const string& mover){
+    // Basic owner and positions
+    if(mv.from.empty()) return 0.0;
+    int fr = mv.from[0], fc = mv.from[1];
+    if(fr<0 || fr>=(int)board.size() || fc<0 || fc>=(int)board[0].size()) return 0.0;
+    if(board[fr][fc].empty()) return 0.0;
+    const string& owner = board[fr][fc].at("owner");
+    (void)mover; // should match owner in our generator
+
+    auto base = mdist_to_own_score(owner, fr, fc);
+
+    if(mv.action=="move"){
+        if(mv.to.size()<2) return 0.0;
+        int tr = mv.to[0], tc = mv.to[1];
+        auto nd = mdist_to_own_score(owner, tr, tc);
+        return (double)(base - nd);
+    }
+    if(mv.action=="push"){
+        if(mv.to.size()<2 || mv.pushed_to.size()<2) return 0.0;
+        int tr = mv.to[0], tc = mv.to[1];
+        int pr = mv.pushed_to[0], pc = mv.pushed_to[1];
+        // mover progress
+        auto nd = mdist_to_own_score(owner, tr, tc);
+        double delta = (double)(base - nd);
+        // effect on pushed piece
+        if(tr>=0 && tr<(int)board.size() && tc>=0 && tc<(int)board[0].size() && !board[tr][tc].empty()){
+            const string& pushed_owner = board[tr][tc].at("owner");
+            int pb = mdist_to_own_score(pushed_owner, tr, tc);
+            int pn = mdist_to_own_score(pushed_owner, pr, pc);
+            if(pushed_owner == owner){
+                // small bonus if we advance our own pushed piece
+                delta += 0.25 * (double)(pb - pn);
+            } else {
+                // benefit if we increase opponent distance
+                delta += -0.5 * (double)(pb - pn); // increases if pn > pb
+            }
+        }
+        return delta;
+    }
+    if(mv.action=="flip" || mv.action=="rotate"){
+        // Default discourage; search can still pick if value deems strong
+        return -0.5;
+    }
+    return 0.0;
+}
+
+// Estimate how many of owner's pieces can reach own scoring row in one move (approximate)
+static int estimate_m_reachable_in_one(const vector<vector<map<string,string>>>& board, const string& owner){
+    int rows = (int)board.size();
+    if(rows==0) return 0; int cols = (int)board[0].size();
+    int target_row = (owner=="circle") ? top_score_row_dynamic() : bottom_score_row_dynamic();
+    if(target_row<0 || target_row>=rows) return 0;
+    int n0 = count_in_score_area(board, owner);
+    // Track unique scoring destinations achievable after a single move
+    set<pair<int,int>> could_place;
+    for(int r=0;r<rows;r++){
+        for(int c=0;c<cols;c++){
+            if(board[r][c].empty() || board[r][c].at("owner")!=owner) continue;
+            auto mv = generate_all_moves(board, r, c);
+            for(const auto& m : mv){
+                auto nb = update_board(board, m);
+                for(int sc : G_SCORE_COLS){
+                    if(sc<0 || sc>=cols) continue;
+                    const auto &cell = nb[target_row][sc];
+                    if(!cell.empty() && cell.at("owner")==owner && cell.at("side")=="stone"){
+                        could_place.insert({target_row, sc});
+                    }
+                }
+            }
+        }
+    }
+    int m_est = (int)could_place.size() - n0;
+    if(m_est < 0) m_est = 0;
+    return m_est;
+}
+
+static inline double quick_state_score(const vector<vector<map<string,string>>>& board, const string& owner){
+    int n = count_in_score_area(board, owner);
+    int m = estimate_m_reachable_in_one(board, owner);
+    return (double)n + 0.1 * (double)m;
+}
+
+static vector<double> softmax_from_deltas(const vector<double>& deltas, double tau){
+    vector<double> w(deltas.size(), 0.0);
+    if(deltas.empty()) return w;
+    double maxv = -1e100; for(double d : deltas) maxv = max(maxv, d);
+    double Z = 0.0;
+    for(size_t i=0;i<deltas.size();++i){
+        double z = (deltas[i] - maxv) / max(1e-6, tau);
+        double e = exp(z);
+        w[i] = e; Z += e;
+    }
+    if(Z <= 0.0){
+        double u = (deltas.empty()?0.0:(1.0/(double)deltas.size()));
+        for(size_t i=0;i<deltas.size();++i) w[i]=u;
+    } else {
+        for(size_t i=0;i<deltas.size();++i) w[i] /= Z;
+    }
+    return w;
+}
+
 // Instant win detection and blocking
 static Move check_for_instant_win(const vector<vector<map<string, string>>>& board,string owner,const map<pair<int,int>,vector<Move>>& moves){
     int need = (G_COLS<=12)?4:((G_COLS<=14)?5:6);
@@ -319,6 +433,9 @@ public:
 
     Move choose(const vector<vector<map<string, string>>>& board,int row,int col,const vector<int>& score_cols,float current_player_time,float opponent_time){
         (void)opponent_time;
+        // Update turn indices for guards and priors
+        turn_index_ += 1;
+        current_turn_index_ = turn_index_;
         G_ROWS=row; G_COLS=col; G_SCORE_COLS=score_cols;
 
         // Precompute all moves per piece for fast checks
@@ -339,12 +456,155 @@ public:
             // fallback: first legal move we own
             for(int i=0;i<n;i++) for(int j=0;j<m;j++) if(!board[i][j].empty() && board[i][j].at("owner")==side){ auto v=generate_all_moves(board,i,j); if(!v.empty()){ best=v[0]; break; } }
         }
+
+        // Backtracking guard: avoid immediate undo of previous move
+        if(last_move_simple.valid && best.action=="move" && last_move_simple.action=="move"){
+            if(!best.from.empty() && !best.to.empty()){
+                if(best.from[0]==last_move_simple.tx && best.from[1]==last_move_simple.ty &&
+                   best.to[0]==last_move_simple.fx && best.to[1]==last_move_simple.fy){
+                    // pick an alternative with non-negative progress if possible
+                    double bestProg = -1e9; bool replaced=false; Move alt=best;
+                    for(const auto &kv : moves_for_current){
+                        int r = kv.first.first, c = kv.first.second;
+                        if(board[r][c].empty() || board[r][c].at("owner")!=side) continue;
+                        for(const auto &mv : kv.second){
+                            if(mv.action=="move" && !mv.from.empty() && !mv.to.empty()){
+                                if(mv.from[0]==last_move_simple.tx && mv.from[1]==last_move_simple.ty &&
+                                   mv.to[0]==last_move_simple.fx && mv.to[1]==last_move_simple.fy) continue; // skip exact undo
+                            }
+                            double d = move_progress_delta_for(board, mv, side);
+                            if(d >= 0.0 && d > bestProg){ bestProg = d; alt = mv; replaced=true; }
+                        }
+                    }
+                    if(replaced) best = alt;
+                }
+            }
+        }
+
+        // Anti-oscillation: avoid immediate flip-back on the same piece unless clearly beneficial
+        if(last_move_simple.valid && last_move_simple.action=="flip" && best.action=="flip"){
+            if(!best.from.empty() && last_move_simple.fx==best.from[0] && last_move_simple.fy==best.from[1]){
+                bool replaced = false;
+                double baseS = quick_state_score(board, side);
+                // Prefer any non-flip/rotate that isn't clearly worse
+                for(const auto &kv : moves_for_current){
+                    int r = kv.first.first, c = kv.first.second;
+                    if(board[r][c].empty() || board[r][c].at("owner")!=side) continue;
+                    for(const auto &mv : kv.second){
+                        if(mv.action=="flip" || mv.action=="rotate") continue;
+                        auto nb = update_board(board, mv);
+                        double d = quick_state_score(nb, side) - baseS;
+                        if(d >= -0.05){ best = mv; replaced = true; break; }
+                    }
+                    if(replaced) break;
+                }
+                if(!replaced){
+                    // Allow only beneficial flips/rotates
+                    for(const auto &kv : moves_for_current){
+                        int r = kv.first.first, c = kv.first.second;
+                        if(board[r][c].empty() || board[r][c].at("owner")!=side) continue;
+                        for(const auto &mv : kv.second){
+                            if(!(mv.action=="flip" || mv.action=="rotate")) continue;
+                            auto nb = update_board(board, mv);
+                            double d = quick_state_score(nb, side) - baseS;
+                            if(d >= 0.2){ best = mv; replaced = true; break; }
+                        }
+                        if(replaced) break;
+                    }
+                }
+            }
+        }
+
+        // Flip cooldown: don't flip same piece again within 2 of our turns unless clearly beneficial
+        if(best.action=="flip" && last_flip_turn_ >= current_turn_index_ - 2){
+            if(!best.from.empty() && last_flip_rc_.first==best.from[0] && last_flip_rc_.second==best.from[1]){
+                bool replaced=false; double baseS = quick_state_score(board, side);
+                for(const auto &kv : moves_for_current){
+                    int r = kv.first.first, c = kv.first.second;
+                    if(board[r][c].empty() || board[r][c].at("owner")!=side) continue;
+                    for(const auto &mv : kv.second){
+                        if(mv.action=="flip" || mv.action=="rotate") continue;
+                        auto nb = update_board(board, mv);
+                        double d = quick_state_score(nb, side) - baseS;
+                        if(d >= -0.05){ best = mv; replaced=true; break; }
+                    }
+                    if(replaced) break;
+                }
+                if(!replaced){
+                    for(const auto &kv : moves_for_current){
+                        int r = kv.first.first, c = kv.first.second;
+                        if(board[r][c].empty() || board[r][c].at("owner")!=side) continue;
+                        for(const auto &mv : kv.second){
+                            if(!(mv.action=="flip" || mv.action=="rotate")) continue;
+                            auto nb = update_board(board, mv);
+                            double d = quick_state_score(nb, side) - baseS;
+                            if(d >= 0.4){ best = mv; replaced=true; break; }
+                        }
+                        if(replaced) break;
+                    }
+                }
+            }
+        }
+
+        // Anti-repetition guard: avoid repeating the same move 3 times in a row
+        SimpleMove current_simple = to_simple(best);
+        if(last_move_simple.valid && same_simple(last_move_simple, current_simple)){
+            consecutive_repeat_count++;
+        } else {
+            consecutive_repeat_count = 0;
+        }
+        if(consecutive_repeat_count >= 3){
+            // Try to choose a different move among our legal moves
+            bool replaced = false;
+            for(const auto &kv : moves_for_current){
+                int r = kv.first.first, c = kv.first.second;
+                if(board[r][c].empty() || board[r][c].at("owner")!=side) continue;
+                for(const auto &mv : kv.second){
+                    if(!same_simple(to_simple(mv), current_simple)){
+                        best = mv; replaced = true; break;
+                    }
+                }
+                if(replaced) break;
+            }
+            consecutive_repeat_count = 0;
+        }
+        last_move_simple = to_simple(best);
+        if(best.action=="flip" && !best.from.empty()){
+            last_flip_rc_ = {best.from[0], best.from[1]};
+            last_flip_turn_ = current_turn_index_;
+        }
+        recent_moves.push_back(last_move_simple);
+        if(recent_moves.size() > 20) recent_moves.erase(recent_moves.begin());
+
         return convert_move_format(best);
     }
 
 private:
     string side;
     random_device rd; mt19937 gen;
+
+    // Anti-repetition helpers
+    struct SimpleMove{
+        string action=""; int fx=-1, fy=-1; int tx=-1, ty=-1; int px=-1, py=-1; string orientation=""; bool valid=false;
+    };
+    SimpleMove last_move_simple; int consecutive_repeat_count = 0; vector<SimpleMove> recent_moves;
+    // Turn tracking and flip cooldown
+    int turn_index_ = 0; int current_turn_index_ = 0; pair<int,int> last_flip_rc_{-1,-1}; int last_flip_turn_ = -1000000;
+
+    SimpleMove to_simple(const Move& m){
+        SimpleMove s; s.action = m.action; s.valid = true;
+        if(!m.from.empty()){ s.fx = m.from[0]; s.fy = m.from[1]; }
+        if(!m.to.empty()){ s.tx = m.to[0]; s.ty = m.to[1]; }
+        if(!m.pushed_to.empty()){ s.px = m.pushed_to[0]; s.py = m.pushed_to[1]; }
+        s.orientation = m.orientation; return s;
+    }
+    bool same_simple(const SimpleMove& a, const SimpleMove& b){
+        if(a.action!=b.action) return false;
+        if(a.action=="push") return a.fx==b.fx && a.fy==b.fy && a.tx==b.tx && a.ty==b.ty && a.px==b.px && a.py==b.py;
+        if(a.action=="move") return a.fx==b.fx && a.fy==b.fy && a.tx==b.tx && a.ty==b.ty;
+        if(a.action=="flip"||a.action=="rotate") return a.fx==b.fx && a.fy==b.fy && a.orientation==b.orientation;
+        return a.fx==b.fx && a.fy==b.fy && a.tx==b.tx && a.ty==b.ty;
+    }
 
     // Move-format conversion (internal row,col -> external col,row)
     Move convert_move_format(const Move& m){ Move r; r.action=m.action; if(!m.from.empty()) r.from={m.from[1],m.from[0]}; if(!m.to.empty()) r.to={m.to[1],m.to[0]}; if(!m.pushed_to.empty()) r.pushed_to={m.pushed_to[1],m.pushed_to[0]}; r.orientation=m.orientation; return r; }
@@ -390,7 +650,19 @@ private:
             root->terminal = is_terminal(board);
             root->moves = collect_moves(board, to_move);
             int M = (int)root->moves.size();
-            root->priors.assign(M, M>0 ? 1.0 / (double)M : 0.0);
+            // Move-centric priors: softmax over progress delta per move
+            vector<double> deltas; deltas.reserve(M);
+            for(int i=0;i<M;i++){
+                double d = move_progress_delta_for(board, root->moves[i], to_move);
+                // Stronger early-game discouragement of flips/rotates unless clearly beneficial
+                if (current_turn_index_ <= 3) {
+                    const string &act = root->moves[i].action;
+                    if ((act=="flip" || act=="rotate") && d < 0.4) d -= 0.4;
+                }
+                deltas.push_back(d);
+            }
+            const double tau = 1.2; // slightly sharper
+            root->priors = softmax_from_deltas(deltas, tau);
             root->children.assign(M, nullptr);
             root->order_by_prior.resize(M);
             iota(root->order_by_prior.begin(), root->order_by_prior.end(), 0);
@@ -398,8 +670,8 @@ private:
             tt[h] = root;
         }
 
-        const double c_puct = 1.2;
-        const int K0 = 6;
+        const double c_puct = 1.0;
+        const int K0 = 8;
         const double K1 = 1.5;
 
         auto start = chrono::high_resolution_clock::now();
@@ -438,7 +710,18 @@ private:
                             if(!child->terminal){
                                 child->moves = collect_moves(child->state, child->to_move);
                                 int CM = (int)child->moves.size();
-                                child->priors.assign(CM, CM>0 ? 1.0/(double)CM : 0.0);
+                                // Move-centric priors for child
+                                vector<double> cd; cd.reserve(CM);
+                                for(int j=0;j<CM;j++){
+                                    double d = move_progress_delta_for(child->state, child->moves[j], child->to_move);
+                                    if (current_turn_index_ <= 3) {
+                                        const string &act = child->moves[j].action;
+                                        if ((act=="flip" || act=="rotate") && d < 0.4) d -= 0.4;
+                                    }
+                                    cd.push_back(d);
+                                }
+                                const double tau_c = 1.2;
+                                child->priors = softmax_from_deltas(cd, tau_c);
                                 child->children.assign(CM, nullptr);
                                 child->order_by_prior.resize(CM);
                                 iota(child->order_by_prior.begin(), child->order_by_prior.end(), 0);
@@ -448,6 +731,10 @@ private:
                         }
                         node->children[idx] = child;
                         double v = leaf_value(child->state, root_side);
+                        // Record visit/value on the newly evaluated child
+                        child->N += 1;
+                        child->W += v;
+                        child->Q = child->W / std::max(1, child->N);
                         path.push_back({node, idx});
                         for(auto &pe : path){
                             MCTSNode* pn = pe.first;
@@ -467,8 +754,8 @@ private:
                     MCTSNode* ch = node->children[idx];
                     if(!ch) continue;
                     double prior = node->priors[idx];
+                    // Q is kept from the root player's perspective; no sign flip needed here.
                     double q = ch->Q;
-                    if(node->to_move != root_side) q = -q;
                     double u = c_puct * prior * sqrtN / (1.0 + (double)ch->N);
                     double score = q + u;
                     if(score > best_score){ best_score = score; best_i = idx; }
@@ -480,11 +767,31 @@ private:
 
             if(!expanded){
                 double v = leaf_value(node->state, root_side);
+                // Update the leaf node itself as visited
+                node->N += 1;
+                node->W += v;
+                node->Q = node->W / std::max(1, node->N);
                 for(auto &pe : path){
                     MCTSNode* pn = pe.first;
                     pn->N += 1;
                     pn->W += v;
                     pn->Q = pn->W / std::max(1, pn->N);
+                }
+            }
+            // Early cutoff: if a root child dominates visits, and we've spent a chunk of time, stop early
+            double elapsed = chrono::duration<double>(now - start).count();
+            if(elapsed > 0.5 * time_limit && root->expanded_count > 0){
+                int totalN = 0; int bestN = -1;
+                for(int k=0;k<root->expanded_count;k++){
+                    int idx = root->order_by_prior[k];
+                    MCTSNode* ch = root->children[idx];
+                    if(!ch) continue;
+                    totalN += ch->N;
+                    if(ch->N > bestN) bestN = ch->N;
+                }
+                if(totalN > 0){
+                    double prop = (double)bestN / (double)totalN;
+                    if(prop >= 0.8) break;
                 }
             }
         }
