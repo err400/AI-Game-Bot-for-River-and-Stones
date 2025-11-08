@@ -426,8 +426,9 @@ static double move_progress_delta_for(const Board& board,
                 // small bonus if we advance our own pushed piece
                 delta += 0.25 * (double)(pb - pn);
             } else {
-                // benefit if we increase opponent distance
-                delta += -0.5 * (double)(pb - pn); // increases if pn > pb
+                // clearer reward: only when we push opponent further from scoring
+                int inc = pn - pb;
+                if(inc > 0) delta += 0.6 * (double)inc;
             }
         }
         return delta;
@@ -814,6 +815,8 @@ public:
     // Precompute moves ONLY for our pieces (avoids expensive precomputation for ALL pieces)
     Board board = convert_board(legacy_board);
     int n=board.size(), m=board[0].size();
+    // Compute current (board, side-to-move) hash for ko tracking
+    uint64_t current_hash = hash_board(board, side);
     for(int i=0;i<n;i++) {
         for(int j=0;j<m;j++) {
             if(board[i][j].side!=SIDE_EMPTY && owner_to_string(board[i][j].owner)==side) {
@@ -821,6 +824,19 @@ public:
             }
         }
     }
+
+        // River-push ko filter: disallow moves that recreate the previous full position
+        auto is_ko = [&](const Move& mv)->bool{
+            if(mv.action != "push") return false; // ko applies to river-push sequences
+            Board nb = update_board(board, mv);
+            string next = (side=="circle"?"square":"circle");
+            uint64_t h = hash_board(nb, next);
+            return (h == last_fullpos_hash_);
+        };
+        for(auto &kv : moves_for_current){
+            auto &vec = kv.second;
+            vec.erase(remove_if(vec.begin(), vec.end(), is_ko), vec.end());
+        }
 
         
         // NEW: Immediate flip of any of our rivers already sitting in scoring row if we still need stones
@@ -834,6 +850,7 @@ public:
                         if(board[score_row][c].side==SIDE_RIVER && owner_to_string(board[score_row][c].owner)==side){
                             // Flip this river to stone (orientation irrelevant)
                             Move flip_move{"flip",{score_row,c},{score_row,c},{}, ""};
+                            last_fullpos_hash_ = current_hash;
                             return convert_move_format(flip_move);
                         }
                     }
@@ -843,7 +860,7 @@ public:
 
         // Tactical guardrails: instant win or block
     Move iw = check_for_instant_win(legacy_board, side, moves_for_current); 
-    if(iw.action!="") return convert_move_format(iw);
+    if(iw.action!=""){ last_fullpos_hash_ = current_hash; return convert_move_format(iw); }
     
         // Only check for opponent instant win if they're close to winning (optimization)
         // This avoids expensive opponent move generation in early game
@@ -862,7 +879,7 @@ public:
             Move ow = check_for_instant_win(legacy_board, opp, opp_moves);
             if(ow.action!=""){ 
                 Move block = find_blocking_move(legacy_board, ow, side, moves_for_current); 
-                if(block.action!="") return convert_move_format(block); 
+                if(block.action!=""){ last_fullpos_hash_ = current_hash; return convert_move_format(block); } 
             }
         }
 
@@ -1021,6 +1038,8 @@ public:
             }
         }
 
+        // Update ko reference to current full position (for next turn)
+        last_fullpos_hash_ = current_hash;
         return convert_move_format(best);
     }
 
@@ -1134,9 +1153,9 @@ private:
         double qs_opp  = quick_state_score(b, opponent_of(root_side));
         double diff = qs_self - qs_opp; // can range broader than [-need,need]
         double scaled = diff / (double)(need + 0.5);
-        // Scale to larger range for better PUCT discrimination
+        // Scale to larger range for better PUCT discrimination (keep non-terminals within ±8)
         scaled *= 10.0;
-        if(scaled>10.0) scaled=10.0; if(scaled<-10.0) scaled=-10.0;
+        if(scaled>8.0) scaled=8.0; if(scaled<-8.0) scaled=-8.0;
         return scaled;
     }
 
@@ -1170,7 +1189,7 @@ private:
             for(int i=0;i<M;i++){
                 double d = move_progress_delta_for(board, root->moves[i], to_move);
                 // Stronger early-game discouragement of flips/rotates unless clearly beneficial
-                if (current_turn_index_ <= 3) {
+                if (current_turn_index_ <= 5) {
                     const string &act = root->moves[i].action;
                     if ((act=="flip" || act=="rotate") && d < 0.1) d -= 0.2;
                 }
@@ -1256,7 +1275,7 @@ private:
                                 vector<double> cd; cd.reserve(CM);
                                 for(int j=0;j<CM;j++){
                                     double d = move_progress_delta_for(child->state, child->moves[j], child->to_move);
-                                    if (current_turn_index_ <= 3) {
+                                    if (current_turn_index_ <= 5) {
                                         const string &act = child->moves[j].action;
                                         if ((act=="flip" || act=="rotate") && d < 0.1) d -= 0.2;
                                     }
@@ -1348,24 +1367,37 @@ private:
 
                 int best_i = -1; double best_score = -1e100;
                 double sqrtN = sqrt((double)std::max(1, node->N));
-                for(int k=0;k<node->expanded_count;k++){
-                    int idx = node->order_by_prior[k];
-                    MCTSNode* ch = node->children[idx];
-                    if(!ch) continue;
-                    double prior = node->priors[idx];
-                    // Q is stored from ROOT perspective. At opponent nodes, minimize root value.
-                    double q_value = (node->to_move == root_side) ? ch->Q : -ch->Q;
-                    // may cause some branches to be evaluated incorrectly. Let me add debug.
-                    double u = c_puct * prior * sqrtN / (1.0 + (double)ch->N);
-                    // Fortress safety: if opponent can immediately threaten (increase m_opp strongly), nudge away
-                    if(node==root){
-                        // Light anti-danger bias only at root selection
+                if(node == root){
+                    // Root-only safety mask: prefer children that don't spike opponent reachability
+                    int best_safe_i = -1; double best_safe_score = -1e100;
+                    int best_any_i  = -1; double best_any_score  = -1e100;
+                    for(int k=0;k<node->expanded_count;k++){
+                        int idx = node->order_by_prior[k];
+                        MCTSNode* ch = node->children[idx];
+                        if(!ch) continue;
+                        double prior = node->priors[idx];
+                        double q_value = (node->to_move == root_side) ? ch->Q : -ch->Q;
+                        double u = c_puct * prior * sqrtN / (1.0 + (double)ch->N);
+                        double score = q_value + u;
+                        if(score > best_any_score){ best_any_score = score; best_any_i = idx; }
                         int m_self = cached_estimate_reach(ch->state, root_side);
                         int m_opp  = cached_estimate_reach(ch->state, opponent_of(root_side));
-                        if(m_opp - m_self >= 2) u *= 0.9; // reduce exploration for dangerous lines
+                        bool safe = (m_opp - m_self <= 1);
+                        if(safe && score > best_safe_score){ best_safe_score = score; best_safe_i = idx; }
                     }
-                    double score = q_value + u;
-                    if(score > best_score){ best_score = score; best_i = idx; }
+                    if(best_safe_i != -1){ best_i = best_safe_i; best_score = best_safe_score; }
+                    else { best_i = best_any_i; best_score = best_any_score; }
+                } else {
+                    for(int k=0;k<node->expanded_count;k++){
+                        int idx = node->order_by_prior[k];
+                        MCTSNode* ch = node->children[idx];
+                        if(!ch) continue;
+                        double prior = node->priors[idx];
+                        double q_value = (node->to_move == root_side) ? ch->Q : -ch->Q;
+                        double u = c_puct * prior * sqrtN / (1.0 + (double)ch->N);
+                        double score = q_value + u;
+                        if(score > best_score){ best_score = score; best_i = idx; }
+                    }
                 }
                 if(best_i < 0) break;
                 path.push_back({node, best_i});
@@ -1516,6 +1548,8 @@ private:
     // Reuse & GC bookkeeping
     uint64_t last_root_hash_ = 0ULL;
     uint64_t last_chosen_child_hash_ = 0ULL;
+    // Ko tracking: store previous full position hash (board + side-to-move)
+    uint64_t last_fullpos_hash_ = 0ULL;
     int current_generation_ = 0;
     // TT limits
     const size_t TT_SIZE_SOFT_LIMIT = 150000; // trigger GC

@@ -10,7 +10,10 @@ import json
 import sys
 import os
 import argparse
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
+import uuid
+from datetime import datetime
+import pathlib
 import logging
 
 # Add parent directory to path for student_agent_cpp import
@@ -155,6 +158,109 @@ class BotClient:
             converted_board.append(converted_row)
         return converted_board
     
+    def _feature_vector(self, board: list, rows: int, cols: int, score_cols: List[int], side: str) -> List[float]:
+        """Compute 16-D feature vector mirroring C++ StateFeatures."""
+        from gameEngine import opponent, count_scoring_pieces, count_reachable_in_one
+
+        def top_score_row() -> int:
+            return 2
+
+        def bottom_score_row() -> int:
+            return rows - 3
+
+        def mdist_to_own_score(owner: str, r: int, c: int) -> int:
+            target_row = top_score_row() if owner == "circle" else bottom_score_row()
+            row_d = abs(r - target_row)
+            col_d = min((abs(c - sc) for sc in score_cols), default=0)
+            return row_d + col_d
+
+        def min_avg_dist(owner: str) -> Tuple[float, float]:
+            mn = 1e9
+            tot = 0.0
+            cnt = 0
+            for y in range(rows):
+                for x in range(cols):
+                    p = board[y][x]
+                    if p and getattr(p, 'side', '') == 'stone' and getattr(p, 'owner', '') == owner:
+                        d = mdist_to_own_score(owner, y, x)
+                        mn = min(mn, float(d))
+                        tot += d
+                        cnt += 1
+            if cnt == 0:
+                return 0.0, 0.0
+            return (0.0 if mn >= 1e8 else float(mn)), float(tot / cnt)
+
+        def count_rivers(owner: str) -> int:
+            c = 0
+            for y in range(rows):
+                for x in range(cols):
+                    p = board[y][x]
+                    if p and getattr(p, 'owner', '') == owner and getattr(p, 'side', '') == 'river':
+                        c += 1
+            return c
+
+        def approx_mob(owner: str) -> int:
+            mob = 0
+            for y in range(rows):
+                for x in range(cols):
+                    p = board[y][x]
+                    if p and getattr(p, 'owner', '') == owner:
+                        for dy, dx in ((1,0),(-1,0),(0,1),(0,-1)):
+                            ny, nx = y+dy, x+dx
+                            if 0 <= ny < rows and 0 <= nx < cols and (board[ny][nx] is None):
+                                mob += 1
+            return mob
+
+        def center_pressure(owner: str) -> float:
+            start = max(0, cols//2 - 1)
+            endc = min(cols-1, start+1)
+            own = 0
+            ownTot = 0
+            for y in range(rows):
+                for x in range(cols):
+                    p = board[y][x]
+                    if p and getattr(p, 'owner', '') == owner:
+                        ownTot += 1
+                        if start <= x <= endc:
+                            own += 1
+            return 0.0 if ownTot == 0 else float(own)/float(ownTot)
+
+        def threat_flag(owner: str) -> int:
+            need = 4 if cols <= 12 else (5 if cols <= 14 else 6)
+            n = float(count_scoring_pieces(board, owner, rows, cols, score_cols))
+            if n >= need - 1:
+                return 1
+            m = float(count_reachable_in_one(board, owner, rows, cols, score_cols))
+            return 1 if m > 0 else 0
+
+        opp = 'square' if side == 'circle' else 'circle'
+        from gameEngine import count_scoring_pieces, count_reachable_in_one
+        n_self = float(count_scoring_pieces(board, side, rows, cols, score_cols))
+        n_opp  = float(count_scoring_pieces(board, opp,  rows, cols, score_cols))
+        m_self = float(count_reachable_in_one(board, side, rows, cols, score_cols))
+        m_opp  = float(count_reachable_in_one(board, opp,  rows, cols, score_cols))
+        md_s_min, md_s_avg = min_avg_dist(side)
+        md_o_min, md_o_avg = min_avg_dist(opp)
+        r_self = float(count_rivers(side))
+        r_opp  = float(count_rivers(opp))
+        mob_s  = float(approx_mob(side))
+        mob_o  = float(approx_mob(opp))
+        cp_s   = float(center_pressure(side))
+        cp_o   = float(center_pressure(opp))
+        th_s   = float(threat_flag(side))
+        th_o   = float(threat_flag(opp))
+
+        return [
+            n_self, n_opp,
+            m_self, m_opp,
+            md_s_min, md_o_min,
+            md_s_avg, md_o_avg,
+            r_self, r_opp,
+            mob_s, mob_o,
+            cp_s, cp_o,
+            th_s, th_o,
+        ]
+
     def play_game(self):
         """Main game loop"""
         logger.info(f"Starting game loop for {self.player} using {self.strategy} strategy")
@@ -165,6 +271,13 @@ class BotClient:
             return
         
         try:
+            # Prepare logging (optional). Set RS_LOG_VALUE=1 to enable.
+            enable_log = os.environ.get('RS_LOG_VALUE', '0') == '1'
+            log_path = os.environ.get('RS_LOG_PATH', os.path.join(os.path.dirname(_PARENT_DIR), 'logs', 'value_data.jsonl'))
+            pending_rows: List[Dict[str, Any]] = []
+            game_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+            last_board_pieces = None
+
             # Wait for game to start
             logger.info("Waiting for game to start...")
             while self.connected:
@@ -182,6 +295,24 @@ class BotClient:
                 
                 if game_state["game_status"] == "finished":
                     logger.info("Game finished!")
+                    # Fetch final board for labeling (use last seen if needed)
+                    final_board = last_board_pieces if last_board_pieces is not None else self.convert_board_format(game_state["board"])
+                    if enable_log and pending_rows:
+                        try:
+                            # Compute final tournament scores
+                            from gameEngine import compute_final_scores
+                            scores = compute_final_scores(final_board, None, game_state["rows"], game_state["cols"], game_state["score_cols"])
+                            # Assign labels and flush
+                            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                            with open(log_path, 'a') as f:
+                                for row in pending_rows:
+                                    row['final_score_from_side'] = float(scores.get(row['side'], 0.0))
+                                    f.write(json.dumps(row) + "\n")
+                            logger.info(f"Wrote {len(pending_rows)} rows to {log_path}")
+                        except Exception as e:
+                            logger.error(f"Failed to write training rows: {e}")
+                        finally:
+                            pending_rows.clear()
                     break
                 
                 if not game_state["your_turn"]:
@@ -192,9 +323,26 @@ class BotClient:
                 # It's our turn!
                 logger.info(f"My turn! Time left: {game_state['time_left']:.1f}s")
                 
-                # Convert board format for agent
+                # Convert board format for agent (and store for logging/labels)
                 converted_board = self.convert_board_format(game_state["board"])
+                last_board_pieces = converted_board
                 
+                # Optionally log features (one row per our move)
+                if enable_log:
+                    feats = self._feature_vector(converted_board, game_state["rows"], game_state["cols"], game_state["score_cols"], self.player)
+                    pending_rows.append({
+                        'features': feats,
+                        'rows': int(game_state['rows']),
+                        'cols': int(game_state['cols']),
+                        'score_cols': list(map(int, game_state['score_cols'])),
+                        'side': self.player,
+                        'meta': {
+                            'game_id': game_id,
+                            'turn': int(game_state.get('turn', 0)),
+                            'strategy': self.strategy,
+                        }
+                    })
+
                 # Get move from agent
                 start_time = time.time()
                 move = self.agent.choose(
@@ -237,7 +385,7 @@ def main():
     parser.add_argument("player", choices=["circle", "square"], help="Player side")
     parser.add_argument("port", type=int, help="Server port (8181 for circle, 8182 for square)")
     parser.add_argument("--server", default="localhost", help="Server host (default: localhost)")
-    parser.add_argument("--strategy", default="random", choices=["random", "student", "student_cpp"],
+    parser.add_argument("--strategy", default="random", choices=["random", "student", "student_cpp", "greedy_river"],
                        help="Bot strategy (default: random)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
     

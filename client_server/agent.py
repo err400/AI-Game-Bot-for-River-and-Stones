@@ -598,5 +598,13 @@ def get_agent(player: str, strategy: str) -> BaseAgent:
         else:
             print("C++ StudentAgent not available. Falling back to Python StudentAgent.")
             return StudentAgent(player)
+    elif strategy == "greedy_river":
+        try:
+            import greedy_river_agent as greedy
+            Greedy = greedy.StudentAgent
+            return Greedy(player)
+        except Exception as e:
+            print(f"Greedy river agent unavailable ({e}). Falling back to Python StudentAgent.")
+            return StudentAgent(player)
     else:
         raise ValueError(f"Unknown strategy: {strategy}. Available: random, student")

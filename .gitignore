@@ -8,3 +8,4 @@ build/
 *.dylib
 __pycache__/
 *.pyc
+build_greedy
