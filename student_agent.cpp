@@ -394,6 +394,41 @@ static int count_connected_scored(const vector<vector<map<string,string>>>& boar
     return cnt;
 }
 
+// Check if scoring zone is blocked by own stones (all scoring cells occupied)
+static bool is_scoring_zone_blocked(const vector<vector<map<string,string>>>& board, const string& owner){
+    int goal_row = (owner=="circle") ? top_score_row_dynamic() : bottom_score_row_dynamic();
+    if(goal_row < 0 || goal_row >= (int)board.size()) return false;
+
+    int occupied_count = 0;
+    for(int c : G_SCORE_COLS){
+        if(c >= 0 && c < (int)board[0].size()){
+            if(!board[goal_row][c].empty() &&
+               board[goal_row][c].at("owner")==owner &&
+               board[goal_row][c].at("side")=="stone"){
+                occupied_count++;
+            }
+        }
+    }
+    // If all (or most) scoring cells are occupied by own stones, zone is blocked
+    return occupied_count >= (int)G_SCORE_COLS.size();
+}
+
+// Count how many empty cells are in scoring zone (more empty = better for scoring later)
+static int count_empty_in_scoring_zone(const vector<vector<map<string,string>>>& board, const string& owner){
+    int goal_row = (owner=="circle") ? top_score_row_dynamic() : bottom_score_row_dynamic();
+    if(goal_row < 0 || goal_row >= (int)board.size()) return 0;
+
+    int empty_count = 0;
+    for(int c : G_SCORE_COLS){
+        if(c >= 0 && c < (int)board[0].size()){
+            if(board[goal_row][c].empty()){
+                empty_count++;
+            }
+        }
+    }
+    return empty_count;
+}
+
 // Terminal test
 static bool is_terminal(const vector<vector<map<string, string>>>& board){
     int need = (G_COLS<=12)?4:((G_COLS<=14)?5:6);
@@ -570,8 +605,39 @@ static int evaluate_function(const vector<vector<map<string, string>>>& board, c
     const int W_PATH_PARTIAL  =  600;  // heuristic two-move connectivity
     const int W_BLOCK_OPP     = 1500;  // block opponent's path
 
+    // NEW: Scoring zone clearance weights
+    const int W_ZONE_BLOCKED  = -4000; // Heavy penalty for having scoring zone blocked
+    const int W_ZONE_CLEAR    =  4000; // Huge bonus for having scoring zone clear
+    const int W_EMPTY_SLOTS   =   800; // Reward empty scoring slots (room to score)
+
     long long eval = 0;
-    eval += W_SCORED * (scored_self - scored_opp);
+
+    // NEW: Check scoring zone blockage status (early game focus)
+    bool zone_self_blocked = is_scoring_zone_blocked(board, owner);
+    bool zone_opp_blocked  = is_scoring_zone_blocked(board, opp);
+    int empty_self         = count_empty_in_scoring_zone(board, owner);
+    int empty_opp          = count_empty_in_scoring_zone(board, opp);
+
+    // Strategic evaluation of scoring zones
+    if(zone_self_blocked && !zone_opp_blocked){
+        eval += W_ZONE_BLOCKED;  // We're blocked, opponent isn't - BAD!
+    } else if(!zone_self_blocked && zone_opp_blocked){
+        eval += W_ZONE_CLEAR;    // We cleared ours, they're blocked - GOOD!
+    }
+
+    // Reward having empty slots in scoring zone (means we can score more stones)
+    eval += W_EMPTY_SLOTS * (empty_self - empty_opp);
+
+    // Count scored stones, but with reduced weight if zone is blocked
+    // (because blocked stones aren't making progress toward winning)
+    if(zone_self_blocked){
+        // Scoring zone blocked: these stones are BLOCKING, not scoring
+        // Reduce their value significantly
+        eval += (W_SCORED / 4) * (scored_self - scored_opp);
+    } else {
+        // Scoring zone clear: these are legitimate scoring stones
+        eval += W_SCORED * (scored_self - scored_opp);
+    }
     eval += W_DIST_DIFF * (sum_dist_self - sum_dist_opp);
     eval += W_NEAR1_SELF * near1_self + W_NEAR2_SELF * near2_self;
     eval -= W_NEAR1_OPP  * near1_opp  + W_NEAR2_OPP  * near2_opp;
@@ -720,6 +786,30 @@ public:
         }
         Move ow = check_for_instant_win(board, opp, moves_opp);
         if(ow.action!=""){ Move block = find_blocking_move(board, ow, side, moves_self); if(block.action!="") return convert_move_format(block); }
+
+        // NEW: Greedy zone clearance - if scoring zone is blocked, prioritize clearing it
+        if(is_scoring_zone_blocked(board, side)){
+            Move best_clear_move = {"",{},{},{},""};
+            int best_clear_delta = 0;
+            int current_blocked = count_in_score_area(board, side);
+
+            for(const auto& kv : moves_self){
+                const auto& v = kv.second;
+                for(const auto& mv : v){
+                    auto nb = update_board(board, mv);
+                    int new_blocked = count_in_score_area(nb, side);
+                    int clear_delta = current_blocked - new_blocked;  // Positive if we cleared stones
+                    if(clear_delta > best_clear_delta){
+                        best_clear_delta = clear_delta;
+                        best_clear_move = mv;
+                    }
+                }
+            }
+            // If we found a move that clears at least one stone from scoring zone, play it!
+            if(best_clear_delta > 0){
+                return convert_move_format(best_clear_move);
+            }
+        }
 
         // Greedy scoring increase: if any move increases stones in scoring area (engine scoring), do it immediately
         int prev_scored = count_in_score_area(board, side);

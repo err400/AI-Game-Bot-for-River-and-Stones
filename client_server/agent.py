@@ -588,15 +588,25 @@ def get_agent(player: str, strategy: str) -> BaseAgent:
     elif strategy == "student":
         return StudentAgent(player)
     elif strategy == "student_cpp":
+        # Robust import: ensure repo root and build/ are on sys.path so we can import student_agent_cpp
+        import sys, os, importlib
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+        build_dir = os.path.join(repo_root, "build")
+        # Prepend repo_root and build_dir so our local modules shadow site-packages (e.g., the pip 'build' package)
+        for p in [repo_root, build_dir]:
+            if p not in sys.path:
+                sys.path.insert(0, p)
         try:
-            import student_agent_cpp as student_agent
+            import student_agent_cpp as student_agent  # requires repo_root on sys.path
+            # Force reload to pick up a freshly-built .so without restarting
+            student_agent = importlib.reload(student_agent)
             StudentAgentCpp = student_agent.StudentAgent
-        except ImportError:
+        except Exception as e:
+            print(f"C++ StudentAgent load failed: {e}. Falling back to Python StudentAgent.")
             StudentAgentCpp = None
         if StudentAgentCpp:
             return StudentAgentCpp(player)
         else:
-            print("C++ StudentAgent not available. Falling back to Python StudentAgent.")
             return StudentAgent(player)
     else:
         raise ValueError(f"Unknown strategy: {strategy}. Available: random, student")

@@ -766,12 +766,16 @@ def run_gui(mode:str, circle_strategy:str, square_strategy:str, load_file:Option
 
     clock = pygame.time.Clock()
     players = {"circle":"human","square":"human"}
+    print("hereeee")
     # if mode == "hvai": players["square"]="ai"
     # elif mode == "aivai": players = {"circle":"ai","square":"ai"}
     if mode=="aivai": players={"circle":"ai","square":"ai"}
     elif mode=="hvh": players={"circle":"human","square":"human"}
     else:
         if circle_strategy=="random": players={"circle":"ai","square":"human"}
+        elif circle_strategy == "student_cpp":
+            print("hi hi")
+            players={"circle":"ai","square":"human"}
         else: players={"circle":"human","square":"ai"}
     
     # instantiate agents (they only receive board)
@@ -1051,6 +1055,9 @@ def run_cli(mode:str, circle_strategy:str, square_strategy:str, load_file:Option
     elif mode=="hvh": players={"circle":"human","square":"human"}
     else:
         if circle_strategy=="random": players={"circle":"ai","square":"human"}
+        elif circle_strategy == "student_cpp":
+            print("hi hi hi hi")
+            players={"circle":"ai","square":"human"}
         else: players={"circle":"human","square":"ai"}
     
     current="circle"; winner=None; turn=0
@@ -1118,7 +1125,8 @@ def run_cli(mode:str, circle_strategy:str, square_strategy:str, load_file:Option
                 turn += 1
                 if turn > 1000:
                     print("Turn limit reached -> draw"); break
-                input("\nPress Enter to continue...")
+                pass  # DISABLED FOR TESTING
+                # input("\nPress Enter to continue...")
                 continue
         else:
             # Human: measure time spent entering the move so the timer decreases
@@ -1171,10 +1179,11 @@ def run_cli(mode:str, circle_strategy:str, square_strategy:str, load_file:Option
             print("Turn limit reached -> draw"); break
 
         # Press Enter pause for readability — DO NOT count this time as player's clock (unchanged behavior)
-        try:
-            _ = input("\nPress Enter to continue...")
-        except KeyboardInterrupt:
-            pass
+        pass  # DISABLED FOR TESTING
+        # try:
+        #     _ = input("\nPress Enter to continue...")
+        # except KeyboardInterrupt:
+        #     pass
         
     # compute and print final scores with remaining times accounted for (CHANGED: pass timers)
     final_scores = compute_final_scores(board, winner, rows, cols, score_cols,

@@ -71,3 +71,10 @@ python bot_client.py circle 8080 --strategy student
 python bot_client.py square 8080 --strategy student --server 10.10.10.10
 ```
 --server will require the IP of system on which server is running. You can use ipconfig/ifconfig to identify the IP address. Provide that IP and it should connect. 
+
+python3 client_server/web_server.py 1235
+
+cd duplicate_folder && python3 client_server/bot_client.py circle 1235 --strategy student_cpp
+
+make cmake-rebuild && python3 client_server/bot_client.py square 1235 --strategy student_cpp
+
