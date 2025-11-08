@@ -8,9 +8,16 @@ import requests
 import time
 import json
 import sys
+import os
 import argparse
 from typing import Dict, Any, Optional
 import logging
+
+# Add parent directory to path for student_agent_cpp import
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PARENT_DIR = os.path.dirname(_SCRIPT_DIR)
+if _PARENT_DIR not in sys.path:
+    sys.path.insert(0, _PARENT_DIR)
 
 # Import game components
 from agent import get_agent

@@ -1,4 +1,21 @@
-import build.student_agent_module as _sam
+import sys, os, importlib
+
+# Make sure our local build/ is preferred over any pip 'build' package
+_REPO_ROOT = os.path.abspath(os.path.dirname(__file__))
+_BUILD_DIR = os.path.join(_REPO_ROOT, "build")
+for _p in (_BUILD_DIR, _REPO_ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+# Try to import the compiled extension from build/
+try:
+    import student_agent_module as _sam
+except Exception:
+    # Fallback: import as build.student_agent_module but ensure our repo_root is first in sys.path
+    try:
+        _sam = importlib.import_module("build.student_agent_module")
+    except Exception as _e:
+        raise ImportError(f"Failed to import compiled student_agent_module from build/: {_e}")
 import copy
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional

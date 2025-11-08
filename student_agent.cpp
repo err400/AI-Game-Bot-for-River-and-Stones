@@ -16,6 +16,7 @@
 #include <numeric>
 #include <fstream>
 #include <sstream>
+#include <iostream>
 using namespace std;
 
 namespace py = pybind11;
@@ -494,6 +495,45 @@ static double move_progress_delta_for(const Board& board,
 
 // Estimate how many of owner's pieces can reach own scoring row in one move (approximate)
 // OPTIMIZED: Use geometric heuristic instead of full move generation to avoid O(n³) complexity
+// Quick check: from a stone at (r,c), can it reach own scoring row via adjacent river network in one move?
+static bool can_reach_score_via_river_one_move(const Board& board, int r, int c, const string& owner){
+    int rows = (int)board.size(); if(rows==0) return false;
+    int cols = (int)board[0].size();
+    int target_row = (owner=="circle") ? top_score_row_dynamic() : bottom_score_row_dynamic();
+    if(target_row<0 || target_row>=rows) return false;
+    auto inb = [&](int x,int y){ return x>=0 && x<rows && y>=0 && y<cols; };
+    auto col_in_sc = [&](int col){ for(int sc: G_SCORE_COLS){ if(sc==col) return true; } return false; };
+    // Explore from any adjacent river cell
+    vector<pair<int,int>> adj{{1,0},{-1,0},{0,1},{0,-1}};
+    vector<vector<char>> vis(rows, vector<char>(cols, 0));
+    deque<pair<int,int>> dq;
+    for(auto [dx,dy]: adj){
+        int nr=r+dx, nc=c+dy; if(!inb(nr,nc)) continue;
+        if(board[nr][nc].side==SIDE_RIVER){ vis[nr][nc]=1; dq.emplace_back(nr,nc); }
+    }
+    while(!dq.empty()){
+        auto [x,y]=dq.front(); dq.pop_front();
+        Ori ori = board[x][y].orientation;
+        vector<pair<int,int>> dirs = (ori==ORI_HORIZONTAL) ? vector<pair<int,int>>{{0,1},{0,-1}}
+                                                           : vector<pair<int,int>>{{1,0},{-1,0}};
+        for(auto [dx,dy]: dirs){
+            int nx=x+dx, ny=y+dy;
+            while(inb(nx,ny)){
+                if(board[nx][ny].side==SIDE_EMPTY){
+                    if(nx==target_row && col_in_sc(ny)) return true; // empty scoring cell reachable
+                } else if(board[nx][ny].side==SIDE_RIVER){
+                    if(!vis[nx][ny]){ vis[nx][ny]=1; dq.emplace_back(nx,ny); }
+                    break; // river continues, switch to exploring from there
+                } else {
+                    break; // blocked by stone
+                }
+                nx+=dx; ny+=dy;
+            }
+        }
+    }
+    return false;
+}
+
 static int estimate_m_reachable_in_one(const Board& board, const string& owner){
     int rows = (int)board.size();
     if(rows==0) return 0; 
@@ -523,6 +563,12 @@ static int estimate_m_reachable_in_one(const Board& board, const string& owner){
                         potential++;
                         break; // count this piece once
                     }
+                }
+            }
+            // River rides: adjacent into a river network that reaches scoring row
+            else {
+                if(can_reach_score_via_river_one_move(board, r, c, owner)){
+                    potential++;
                 }
             }
         }
@@ -1026,8 +1072,8 @@ private:
         // GC bookkeeping
         int generation = 0;               // created when agent generation was this value
         int last_access_generation = 0;   // last touched generation (for reachability/recency GC)
-        // NOTE: Q/W are stored from THIS node's perspective (to_move player)
-        // Backup flips sign when passing through nodes of different players
+        // NOTE: Q/W are stored from ROOT player's perspective (root_side)
+        // Backup does NOT flip sign; selection/tie-break also use root perspective
     };
 
     unordered_map<uint64_t,MCTSNode*> tt;
@@ -1126,7 +1172,7 @@ private:
                 // Stronger early-game discouragement of flips/rotates unless clearly beneficial
                 if (current_turn_index_ <= 3) {
                     const string &act = root->moves[i].action;
-                    if ((act=="flip" || act=="rotate") && d < 0.4) d -= 0.4;
+                    if ((act=="flip" || act=="rotate") && d < 0.1) d -= 0.2;
                 }
                 deltas.push_back(d);
             }
@@ -1190,9 +1236,13 @@ private:
                         string child_to_move = opponent_of(node->to_move);
                         uint64_t ch = hash_board(nb, child_to_move);
                         MCTSNode* child = nullptr;
+                        bool tt_hit = false;
+                        // TEMPORARY: Disable TT reuse to avoid double-counting bug
+                        // TODO: Implement proper TT handling (virtual loss or separate tree)
                         auto jt = tt.find(ch);
-                        if(jt != tt.end()){
+                        if(false && jt != tt.end()){  // Disabled
                             child = jt->second;
+                            tt_hit = true;  // Mark that this was a TT hit
                         } else {
                             child = new MCTSNode();
                             child->state = std::move(nb);
@@ -1208,7 +1258,7 @@ private:
                                     double d = move_progress_delta_for(child->state, child->moves[j], child->to_move);
                                     if (current_turn_index_ <= 3) {
                                         const string &act = child->moves[j].action;
-                                        if ((act=="flip" || act=="rotate") && d < 0.4) d -= 0.4;
+                                        if ((act=="flip" || act=="rotate") && d < 0.1) d -= 0.2;
                                     }
                                     cd.push_back(d);
                                 }
@@ -1225,28 +1275,70 @@ private:
                             nodes_created_this_search++;  // Track node creation
                         }
                         node->children[idx] = child;
-                        
-                        // FIXED: Evaluate the newly expanded node (child), not after another move
-                        double v = leaf_value(child->state, root_side);
-                        
+
+                        // Evaluate or reuse existing evaluation
+                        double v;
+                        if(tt_hit){
+                            // TT hit: use existing Q-value instead of re-evaluating
+                            // This prevents double-counting the same position's value
+                            v = child->Q;
+                        } else {
+                            // New node: evaluate it
+                            v = leaf_value(child->state, root_side);
+                        }
+
+                        // Debug: Log expansions, especially high values
+                        if(false && current_turn_index_ == 1 && (root->N < 5 || fabs(v) > 40.0)){
+                            cerr << "  Expand[depth=" << path.size() << "]: child to_move=" << child->to_move
+                                 << " v=" << v << (tt_hit ? " [TT_HIT]" : "");
+                            if(fabs(v) > 40.0){
+                                cerr << " TERMINAL! n_circle=" << count_in_score_area(child->state, "circle")
+                                     << " n_square=" << count_in_score_area(child->state, "square");
+                                // Print the IMMEDIATE move that led here
+                                cerr << "\n    Last move: " << node->moves[idx].action;
+                                if(!node->moves[idx].from.empty())
+                                    cerr << " from(" << node->moves[idx].from[0] << "," << node->moves[idx].from[1] << ")";
+                                if(!node->moves[idx].to.empty())
+                                    cerr << " to(" << node->moves[idx].to[0] << "," << node->moves[idx].to[1] << ")";
+                                // Print scoring row
+                                int score_row = (root_side == "circle") ? top_score_row_dynamic() : bottom_score_row_dynamic();
+                                cerr << "\n    Scoring row " << score_row << ": ";
+                                for(int sc : G_SCORE_COLS){
+                                    if(child->state[score_row][sc].side == SIDE_STONE){
+                                        cerr << "col" << sc << "="
+                                             << owner_to_string(child->state[score_row][sc].owner)[0] << " ";
+                                    }
+                                }
+                                // Count total stones on board
+                                int total_stones = 0;
+                                for(int i=0;i<(int)child->state.size();i++){
+                                    for(int j=0;j<(int)child->state[0].size();j++){
+                                        if(child->state[i][j].side==SIDE_STONE) total_stones++;
+                                    }
+                                }
+                                cerr << "\n    Total stones on board: " << total_stones << " (should be ~10)";
+                            }
+                            cerr << endl;
+                        }
+
                         // Backup: maintain values from root perspective
                         // Add path edge before backup
                         path.push_back({node, idx});
-                        
-                        // Backup value: flip sign when backing through opponent nodes
+
+                        // Backup value: root perspective everywhere (no sign flips)
                         for(auto it = path.rbegin(); it != path.rend(); ++it){
                             MCTSNode* pn = it->first;
                             pn->N += 1;
-                            // Store W from root perspective: flip v if this node is opponent's turn
-                            double v_for_node = (pn->to_move == root_side) ? v : -v;
-                            pn->W += v_for_node;
+                            pn->W += v;
                             pn->Q = pn->W / std::max(1, pn->N);
                         }
-                        // Also update the child itself
-                        child->N += 1;
-                        double v_for_child = (child->to_move == root_side) ? v : -v;
-                        child->W += v_for_child;
-                        child->Q = child->W / std::max(1, child->N);
+                        // Also update the child itself - BUT only if it's a NEW node, not a TT hit
+                        // TT hits have already been evaluated; updating them again causes double-counting
+                        if(!tt_hit){
+                            child->N += 1;
+                            child->W += v;
+                            child->Q = child->W / std::max(1, child->N);
+                        }
                         child->last_access_generation = current_generation_;
                         
                         expanded = true;
@@ -1261,15 +1353,15 @@ private:
                     MCTSNode* ch = node->children[idx];
                     if(!ch) continue;
                     double prior = node->priors[idx];
-                    // FIXED: Q is stored from each node's own perspective after backup
-                    // At selection, we want to maximize our own Q
-                    double q_value = ch->Q;
+                    // Q is stored from ROOT perspective. At opponent nodes, minimize root value.
+                    double q_value = (node->to_move == root_side) ? ch->Q : -ch->Q;
+                    // may cause some branches to be evaluated incorrectly. Let me add debug.
                     double u = c_puct * prior * sqrtN / (1.0 + (double)ch->N);
                     // Fortress safety: if opponent can immediately threaten (increase m_opp strongly), nudge away
                     if(node==root){
                         // Light anti-danger bias only at root selection
-                        int m_self = estimate_m_reachable_in_one(ch->state, root_side);
-                        int m_opp  = estimate_m_reachable_in_one(ch->state, opponent_of(root_side));
+                        int m_self = cached_estimate_reach(ch->state, root_side);
+                        int m_opp  = cached_estimate_reach(ch->state, opponent_of(root_side));
                         if(m_opp - m_self >= 2) u *= 0.9; // reduce exploration for dangerous lines
                     }
                     double score = q_value + u;
@@ -1286,18 +1378,16 @@ private:
                 // Re-evaluate the leaf that was selected but couldn't expand further
                 double v = leaf_value(node->state, root_side);
                 
-                // Backup with perspective correction
+                // Backup: root perspective everywhere (no sign flips)
                 for(auto it = path.rbegin(); it != path.rend(); ++it){
                     MCTSNode* pn = it->first;
                     pn->N += 1;
-                    double v_for_node = (pn->to_move == root_side) ? v : -v;
-                    pn->W += v_for_node;
+                    pn->W += v;
                     pn->Q = pn->W / std::max(1, pn->N);
                 }
                 // Update leaf node itself
                 node->N += 1;
-                double v_for_leaf = (node->to_move == root_side) ? v : -v;
-                node->W += v_for_leaf;
+                node->W += v;
                 node->Q = node->W / std::max(1, node->N);
                 node->last_access_generation = current_generation_;
             }
@@ -1323,10 +1413,28 @@ private:
         if(M == 0) return {"",{},{},{},""};
         int best_idx = -1; int bestN = -1; double bestQ = -1e18;
         int cap = root->expanded_count;
+
+        // Debug: Print top 5 candidates
+        if(false){
+            cerr << "\n=== MCTS Decision (Turn " << current_turn_index_ << ", " << root_side << ") ===" << endl;
+            cerr << "Root N=" << root->N << " expanded=" << cap << "/" << M << endl;
+            for(int k=0;k<min(5, cap);k++){
+                int idx = root->order_by_prior[k];
+                MCTSNode* ch = root->children[idx];
+                if(!ch) continue;
+                const Move& mv = root->moves[idx];
+                cerr << k+1 << ". " << mv.action;
+                if(!mv.from.empty()) cerr << " from(" << mv.from[0] << "," << mv.from[1] << ")";
+                if(!mv.to.empty()) cerr << " to(" << mv.to[0] << "," << mv.to[1] << ")";
+                cerr << " | N=" << ch->N << " Q=" << ch->Q << " prior=" << root->priors[idx] << endl;
+            }
+        }
+
         for(int k=0;k<cap;k++){
             int idx = root->order_by_prior[k];
             MCTSNode* ch = root->children[idx];
             if(!ch) continue;
+            // Compare using root perspective for tie-break
             int n = ch->N; double q = ch->Q;
             if(n > bestN || (n==bestN && q>bestQ)){
                 bestN = n; bestQ = q; best_idx = idx;
@@ -1334,14 +1442,16 @@ private:
         }
         if(best_idx < 0) best_idx = 0;
 
+        if(false){ cerr << "=> Chose: " << root->moves[best_idx].action << " with N=" << bestN << " Q=" << bestQ << endl; }
+
         // Fortress fallback: if all root candidates look clearly negative and no instant win/block, prefer safe set
         // Safety criterion: limit opponent reachability growth and prefer better margin
         if(bestQ < -0.35 && cap > 0){
             int safe_idx = -1; double best_margin = -1e18; int bestN2=-1;
             for(int k=0;k<cap;k++){
                 int idx = root->order_by_prior[k]; MCTSNode* ch = root->children[idx]; if(!ch) continue;
-                int m_self = estimate_m_reachable_in_one(ch->state, root_side);
-                int m_opp  = estimate_m_reachable_in_one(ch->state, opponent_of(root_side));
+                int m_self = cached_estimate_reach(ch->state, root_side);
+                int m_opp  = cached_estimate_reach(ch->state, opponent_of(root_side));
                 // Safe if opponent reachability doesn't spike compared to self
                 if(m_opp - m_self > 1) continue;
                 double qs_self = quick_state_score(ch->state, root_side);
@@ -1366,7 +1476,9 @@ private:
             }
         }
         // After decision, run GC if TT exceeds soft limit — keep only chosen subtree if available
-        perform_gc(chosen_child_ptr ? chosen_child_ptr : root);
+        if(tt.size() > TT_SIZE_SOFT_LIMIT){
+            perform_gc(chosen_child_ptr ? chosen_child_ptr : root);
+        }
         return root->moves[best_idx];
     }
 
