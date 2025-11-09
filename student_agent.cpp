@@ -912,6 +912,13 @@ public:
             }
         }
 
+        // Normalize clocks (time-aware selection)
+        {
+            double Tcap = 20.0; // scale ~20s (tune)
+            time_self_norm_ = std::max(0.0, std::min(1.0, (double)current_player_time / Tcap));
+            time_opp_norm_  = std::max(0.0, std::min(1.0, (double)opponent_time / Tcap));
+        }
+
         // Time budget: cap at 0.7s max to prevent memory explosion
         // Reduced from 0.5-0.8s to 0.3-0.7s for safety
         double time_limit = 0.3 + 0.4 * std::min(1.0, std::max(0.0, (double)current_player_time / 20.0));
@@ -1403,10 +1410,18 @@ private:
                 int best_i = -1; double best_score = -1e100;
                 double sqrtN = sqrt((double)std::max(1, node->N));
                 if(node == root){
-                    // Root-only safety mask: prefer children that don't spike opponent reachability
+                    // Root-only safety mask with time-aware blend of progress vs risk
                     int best_safe_i = -1; double best_safe_score = -1e100;
                     int best_any_i  = -1; double best_any_score  = -1e100;
                     int worst_any_i = -1; double worst_any_score = 1e100;
+                    // Time-aware weights derived from remaining clocks
+                    double t_self = time_self_norm_;
+                    double t_opp  = time_opp_norm_;
+                    double t_gap  = t_self - t_opp;
+                    auto clampd = [](double x,double lo,double hi){ return x<lo?lo:(x>hi?hi:x); };
+                    double alpha_def = clampd(1.0 - t_self + 0.5*std::max(0.0, -t_gap), 0.0, 1.0);
+                    double beta_push = clampd(0.2 + 0.8*t_self + 0.3*std::max(0.0, t_gap), 0.2, 1.4);
+                    auto strong_advance = [&](const Move& mv){ return move_progress_delta_for(node->state, mv, root_side) >= 2.0; };
                     for(int k=0;k<node->expanded_count;k++){
                         int idx = node->order_by_prior[k];
                         MCTSNode* ch = node->children[idx];
@@ -1414,11 +1429,18 @@ private:
                         double prior = node->priors[idx];
                         double q_value = (node->to_move == root_side) ? ch->Q : -ch->Q;
                         double u = c_puct * prior * sqrtN / (1.0 + (double)ch->N);
-                        double score = q_value + u;
-                        if(score > best_any_score){ best_any_score = score; best_any_i = idx; }
-                        if(score < worst_any_score){ worst_any_score = score; worst_any_i = idx; }
+                        // Time-aware blend terms
+                        double P = move_progress_delta_for(node->state, node->moves[idx], root_side);
                         int m_self = cached_estimate_reach(ch->state, root_side);
                         int m_opp  = cached_estimate_reach(ch->state, opponent_of(root_side));
+                        double R = std::max(0, m_opp - m_self);
+                        double score = q_value + u + beta_push*P - alpha_def*R;
+                        if(alpha_def > 0.5 && strong_advance(node->moves[idx])){
+                            // reduce defensive penalty for clearly good advances
+                            score += 0.5 * alpha_def * R;
+                        }
+                        if(score > best_any_score){ best_any_score = score; best_any_i = idx; }
+                        if(score < worst_any_score){ worst_any_score = score; worst_any_i = idx; }
                         bool safe = (m_opp - m_self <= 1);
                         if(safe && score > best_safe_score){ best_safe_score = score; best_safe_i = idx; }
                     }
@@ -1723,6 +1745,9 @@ private:
             else { ++it; }
         }
     }
+    // Time context (normalized clocks for time-aware selection)
+    double time_self_norm_ = 1.0;
+    double time_opp_norm_  = 1.0;
     // Optional knobs
     double root_noise_eps_ = 0.0;
     bool   adversarial_select_root_ = false;
