@@ -136,7 +136,8 @@ def spawn_bot(cmd: List[str], env_overrides: Dict[str, str] | None = None) -> su
     env = os.environ.copy()
     if env_overrides:
         env.update(env_overrides)
-    return subprocess.Popen(cmd, cwd=str(REPO_ROOT))
+    # Important: pass env to propagate RS_* logging/search overrides into bot process
+    return subprocess.Popen(cmd, cwd=str(REPO_ROOT), env=env)
 
 
 def run_one_game(port: int,
