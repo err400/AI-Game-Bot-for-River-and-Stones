@@ -50,14 +50,31 @@ def build_main_student_cpp():
 
 
 def build_greedy_if_needed():
-    so_candidates = list((REPO_ROOT / "build_greedy").glob("greedy_river_module*.so"))
+    bg = REPO_ROOT / "build_greedy"
+    so_candidates = list(bg.glob("greedy_river_module*.so"))
     if so_candidates:
         print(f"[build] greedy module present: {so_candidates[0].name}")
         return
     print("[build] building greedy_river_module in build_greedy/ …")
-    # Configure and build with CMake
-    run(["cmake", "-S", ".", "-B", "build_greedy", "-DCMAKE_BUILD_TYPE=Release", "-DPYBIND11_FINDPYTHON=ON"], cwd=REPO_ROOT)
-    run(["cmake", "--build", "build_greedy", "-j"], cwd=REPO_ROOT)
+    bg.mkdir(parents=True, exist_ok=True)
+    cmake_lists = bg / "CMakeLists.txt"
+    if not cmake_lists.exists():
+        # Write a minimal CMakeLists for greedy module
+        cmake_lists.write_text(
+            """
+cmake_minimum_required(VERSION 3.15)
+project(greedy_river_agent)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
+find_package(pybind11 REQUIRED)
+pybind11_add_module(greedy_river_module ../greedy_river_agent.cpp)
+target_compile_options(greedy_river_module PRIVATE $<$<CONFIG:Release>:-O3>)
+""".strip()
+        )
+    # Configure and build inside build_greedy
+    run(["cmake", ".", "-DCMAKE_BUILD_TYPE=Release", "-DPYBIND11_FINDPYTHON=ON"], cwd=bg)
+    run(["cmake", "--build", ".", "-j"], cwd=bg)
 
 
 def build_duplicate_student_cpp_if_needed():
@@ -132,14 +149,25 @@ def run_one_game(port: int,
     # New game
     http_create_game(port, board_size)
     # Start bots
+    print(f"[spawn] circle: {' '.join(map(shlex.quote, circle_cmd))}")
     pc = spawn_bot(circle_cmd, circle_env)
+    time.sleep(0.3)
+    print(f"[spawn] square: {' '.join(map(shlex.quote, square_cmd))}")
     ps = spawn_bot(square_cmd, square_env)
     start = time.time()
     ok = True
     try:
+        early_window = 3.0
         while True:
             if pc.poll() is not None and ps.poll() is not None:
                 break
+            # If within early window one bot has exited, warn
+            elapsed = time.time() - start
+            if elapsed < early_window:
+                if pc.poll() is not None and ps.poll() is None:
+                    print("[warn] circle bot exited early; check its logs")
+                if ps.poll() is not None and pc.poll() is None:
+                    print("[warn] square bot exited early; check its logs (likely import/build issue)")
             if time.time() - start > timeout_sec:
                 ok = False
                 print("[warn] game timeout; terminating bots …")
@@ -161,6 +189,7 @@ def main():
     ap.add_argument("--log-path", default=str(REPO_ROOT / "logs" / "value_data.jsonl"))
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--timeout", type=int, default=300, help="Per-game timeout in seconds")
+    ap.add_argument("--restart-each", action="store_true", help="Restart the web server between games (more robust if server gets stuck)")
     ap.add_argument("--root-noise", type=float, default=None, help="Mix root priors with uniform by this epsilon (RS_ROOT_NOISE)")
     ap.add_argument("--c-puct", type=float, default=None, help="Override c_puct (RS_C_PUCT)")
     ap.add_argument("--k0", type=int, default=None, help="Override progressive widening K0 (RS_K0)")
@@ -265,6 +294,11 @@ def main():
                     total += 1
                     if not ok:
                         print("[warn] game ended due to timeout")
+                    # Optional restart for isolation between games
+                    if args.restart_each:
+                        stop_process(srv)
+                        time.sleep(0.5)
+                        srv = start_server(args.port)
                     time.sleep(0.5)
         print(f"\nDone. Games attempted: {total}")
     finally:
