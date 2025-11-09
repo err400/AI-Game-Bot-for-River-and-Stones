@@ -3,8 +3,15 @@ import sys, os, importlib
 # Make sure our local build/ is preferred over any pip 'build' package
 _REPO_ROOT = os.path.abspath(os.path.dirname(__file__))
 _BUILD_DIR = os.path.join(_REPO_ROOT, "build")
-for _p in (_BUILD_DIR, _REPO_ROOT):
-    if _p not in sys.path:
+
+# Optional override: prefer a provided module search path (for snapshots/leagues)
+_OVERRIDE_DIR = os.environ.get("RS_STUDENT_MODULE_PATH")
+search_paths = []
+if _OVERRIDE_DIR:
+    search_paths.append(_OVERRIDE_DIR)
+search_paths.extend([_BUILD_DIR, _REPO_ROOT])
+for _p in search_paths:
+    if _p and _p not in sys.path:
         sys.path.insert(0, _p)
 
 # Try to import the compiled extension from build/
@@ -161,6 +168,31 @@ class StudentAgent:
             except Exception:
                 pass
         return move_dict
+
+    def evaluate(self, game_state_or_board, rows=None, cols=None, score_cols=None, side=None, time_limit: float = 1.5) -> float:
+        """Evaluate a state using the underlying MCTS (returns root-side value).
+
+        Accepts either a full game_state dict with keys {board, rows, cols, score_cols}
+        or the tuple (board, rows, cols, score_cols).
+        """
+        if isinstance(game_state_or_board, dict):
+            gs = game_state_or_board
+            board = gs["board"]
+            rows = int(gs["rows"]) if rows is None else int(rows)
+            cols = int(gs["cols"]) if cols is None else int(cols)
+            score_cols = _to_int_list(gs["score_cols"]) if score_cols is None else _to_int_list(score_cols)
+            side = side or self._side
+        else:
+            board = game_state_or_board
+            rows = int(rows)
+            cols = int(cols)
+            score_cols = _to_int_list(score_cols)
+            side = side or self._side
+
+        board_norm = _normalize_board(board)
+        # The C++ binding expects legacy format (vector<map>) and side explicitly
+        val = self._impl.evaluate(board_norm, rows, cols, score_cols, str(side), float(time_limit))
+        return float(val)
 
 def test_student_agent():
     """

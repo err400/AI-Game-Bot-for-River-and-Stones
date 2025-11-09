@@ -330,12 +330,19 @@ class BotClient:
                 # Optionally log features (one row per our move)
                 if enable_log:
                     feats = self._feature_vector(converted_board, game_state["rows"], game_state["cols"], game_state["score_cols"], self.player)
+                    try:
+                        # Log raw serializable board from server so we can run teacher evaluation later
+                        serial_board = game_state["board"]
+                    except Exception:
+                        # Fallback: convert back to dicts
+                        serial_board = [[cell.to_dict() if cell else None for cell in row] for row in converted_board]
                     pending_rows.append({
                         'features': feats,
                         'rows': int(game_state['rows']),
                         'cols': int(game_state['cols']),
                         'score_cols': list(map(int, game_state['score_cols'])),
                         'side': self.player,
+                        'board': serial_board,
                         'meta': {
                             'game_id': game_id,
                             'turn': int(game_state.get('turn', 0)),

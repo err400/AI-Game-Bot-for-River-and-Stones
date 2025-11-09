@@ -795,6 +795,34 @@ class StudentAgent {
 public:
     explicit StudentAgent(string s) : side(std::move(s)), gen(rd()){
         load_value_model();
+        // Runtime knobs via environment variables (optional)
+        try {
+            if(const char* rn = getenv("RS_ROOT_NOISE")){
+                root_noise_eps_ = std::stod(std::string(rn));
+                if(root_noise_eps_ < 0.0) root_noise_eps_ = 0.0;
+                if(root_noise_eps_ > 0.9) root_noise_eps_ = 0.9;
+            }
+        } catch(...) { root_noise_eps_ = 0.0; }
+        if(const char* adv = getenv("RS_ADVERSARIAL")){
+            std::string v(adv);
+            adversarial_select_root_ = (v=="1" || v=="true" || v=="TRUE");
+        }
+        try {
+            if(const char* cp = getenv("RS_C_PUCT")){
+                c_puct_ = std::stod(std::string(cp));
+                if(c_puct_ < 0.1) c_puct_ = 0.1; if(c_puct_ > 5.0) c_puct_ = 5.0;
+            }
+        } catch(...) { /* keep default */ }
+        try {
+            if(const char* k0 = getenv("RS_K0")){
+                K0_ = std::stoi(std::string(k0)); if(K0_ < 1) K0_ = 1;
+            }
+        } catch(...) { /* keep default */ }
+        try {
+            if(const char* k1 = getenv("RS_K1")){
+                K1_ = std::stod(std::string(k1)); if(K1_ < 0.1) K1_ = 0.1;
+            }
+        } catch(...) { /* keep default */ }
     }
 
     Move choose(const vector<vector<map<string, string>>>& legacy_board,int row,int col,const vector<int>& score_cols,float current_player_time,float opponent_time){
@@ -1197,6 +1225,12 @@ private:
             }
             const double tau = 1.2; // slightly sharper
             root->priors = softmax_from_deltas(deltas, tau);
+            // Optional: root prior noise (uniform mix) for exploration
+            if(root_noise_eps_ > 1e-9 && M > 0){
+                double eps = root_noise_eps_;
+                double uni = 1.0 / (double)M;
+                for(int i=0;i<M;i++) root->priors[i] = (1.0 - eps) * root->priors[i] + eps * uni;
+            }
             root->children.assign(M, nullptr);
             root->order_by_prior.resize(M);
             iota(root->order_by_prior.begin(), root->order_by_prior.end(), 0);
@@ -1208,9 +1242,9 @@ private:
         // Provide current root for GC later
         last_root_hash_ = h;
 
-    const double c_puct = 1.2;
-    const int K0 = 6;
-        const double K1 = 1.5;
+        const double c_puct = c_puct_;
+        const int    K0     = K0_;
+        const double K1     = K1_;
         
         // Memory safety: limit nodes created per search to prevent std::bad_alloc
         int MAX_NODES_PER_SEARCH = 50000;  // default ~10MB per search
@@ -1371,6 +1405,7 @@ private:
                     // Root-only safety mask: prefer children that don't spike opponent reachability
                     int best_safe_i = -1; double best_safe_score = -1e100;
                     int best_any_i  = -1; double best_any_score  = -1e100;
+                    int worst_any_i = -1; double worst_any_score = 1e100;
                     for(int k=0;k<node->expanded_count;k++){
                         int idx = node->order_by_prior[k];
                         MCTSNode* ch = node->children[idx];
@@ -1380,13 +1415,19 @@ private:
                         double u = c_puct * prior * sqrtN / (1.0 + (double)ch->N);
                         double score = q_value + u;
                         if(score > best_any_score){ best_any_score = score; best_any_i = idx; }
+                        if(score < worst_any_score){ worst_any_score = score; worst_any_i = idx; }
                         int m_self = cached_estimate_reach(ch->state, root_side);
                         int m_opp  = cached_estimate_reach(ch->state, opponent_of(root_side));
                         bool safe = (m_opp - m_self <= 1);
                         if(safe && score > best_safe_score){ best_safe_score = score; best_safe_i = idx; }
                     }
-                    if(best_safe_i != -1){ best_i = best_safe_i; best_score = best_safe_score; }
-                    else { best_i = best_any_i; best_score = best_any_score; }
+                    if(adversarial_select_root_ && worst_any_i != -1){
+                        best_i = worst_any_i; best_score = worst_any_score;
+                    } else if(best_safe_i != -1){
+                        best_i = best_safe_i; best_score = best_safe_score;
+                    } else {
+                        best_i = best_any_i; best_score = best_any_score;
+                    }
                 } else {
                     for(int k=0;k<node->expanded_count;k++){
                         int idx = node->order_by_prior[k];
@@ -1514,6 +1555,87 @@ private:
         return root->moves[best_idx];
     }
 
+public:
+    // Return root value estimate from MCTS search with a fixed time budget (seconds)
+    double evaluate(const vector<vector<map<string,string>>>& legacy_board,
+                    int rows, int cols, const vector<int>& score_cols,
+                    const string& root_side,
+                    double time_limit){
+        G_ROWS = rows; G_COLS = cols; G_SCORE_COLS = score_cols;
+        Board board = convert_board(legacy_board);
+        // Simple wrapper: run a search and return root->Q
+        init_zobrist(rows, cols);
+        string to_move = root_side;
+        MCTSNode* root = new MCTSNode();
+        root->state = board;
+        root->to_move = to_move;
+        root->hash = 0ULL;
+        root->terminal = is_terminal(board);
+        root->moves = collect_moves(board, to_move);
+        int M = (int)root->moves.size();
+        vector<double> deltas; deltas.reserve(M);
+        for(int i=0;i<M;i++) deltas.push_back(move_progress_delta_for(board, root->moves[i], to_move));
+        const double tau = 1.2;
+        root->priors = softmax_from_deltas(deltas, tau);
+        if(root_noise_eps_ > 1e-9 && M > 0){
+            double eps = root_noise_eps_;
+            double uni = 1.0 / (double)M;
+            for(int i=0;i<M;i++) root->priors[i] = (1.0 - eps) * root->priors[i] + eps * uni;
+        }
+        root->children.assign(M, nullptr);
+        root->order_by_prior.resize(M);
+        iota(root->order_by_prior.begin(), root->order_by_prior.end(), 0);
+        sort(root->order_by_prior.begin(), root->order_by_prior.end(), [&](int a,int b){ return root->priors[a] > root->priors[b]; });
+
+        const double c_puct = c_puct_;
+        const int    K0     = K0_;
+        const double K1     = K1_;
+
+        auto start = chrono::high_resolution_clock::now();
+        while(true){
+            auto now = chrono::high_resolution_clock::now();
+            if(chrono::duration<double>(now - start).count() >= time_limit) break;
+            vector<pair<MCTSNode*, int>> path;
+            MCTSNode* node = root;
+            const int MAX_DEPTH = 100; int depth=0;
+            while(true){
+                if(node->terminal) break; int M2 = (int)node->moves.size(); if(M2==0) break; if(depth>=MAX_DEPTH) break;
+                int K = std::max(K0, (int)floor(K1 * sqrt(std::max(1, node->N)))); K = std::min(K, M2);
+                if(node->expanded_count < K){
+                    int idx = node->order_by_prior[node->expanded_count++];
+                    if(node->children[idx] == nullptr){
+                        auto nb = update_board(node->state, node->moves[idx]);
+                        MCTSNode* child = new MCTSNode();
+                        child->state = std::move(nb);
+                        child->to_move = opponent_of(node->to_move);
+                        child->hash = 0ULL;
+                        child->terminal = is_terminal(child->state);
+                        child->moves = collect_moves(child->state, child->to_move);
+                        node->children[idx] = child;
+                    }
+                    path.push_back({node, idx}); node = node->children[idx]; depth++; continue;
+                }
+                int best_i=-1; double best_score=-1e100; double sqrtN=sqrt((double)std::max(1,node->N));
+                for(int k=0;k<node->expanded_count;k++){
+                    int idx=node->order_by_prior[k]; MCTSNode* ch=node->children[idx]; if(!ch) continue;
+                    double prior=node->priors[idx]; double q_value=(node->to_move==root_side)?ch->Q:-ch->Q; double u=c_puct*prior*sqrtN/(1.0+(double)ch->N); double score=q_value+u; if(score>best_score){best_score=score; best_i=idx;}
+                }
+                if(best_i<0) break; path.push_back({node,best_i}); node=node->children[best_i]; depth++;
+            }
+            double v = leaf_value(node->state, root_side);
+            for(auto it=path.rbegin(); it!=path.rend(); ++it){ MCTSNode* pn=it->first; pn->N += 1; pn->W += v; pn->Q = pn->W / std::max(1, pn->N); }
+        }
+        double q = root->Q;
+        // Cleanup scratch tree
+        vector<MCTSNode*> st{root};
+        while(!st.empty()){
+            MCTSNode* nd = st.back(); st.pop_back();
+            for(auto* ch : nd->children) if(ch) st.push_back(ch);
+            delete nd;
+        }
+        return q;
+    }
+
     void load_value_model(){
         // Try models/value_v1.txt (whitespace or comma separated doubles)
         vector<string> candidates = {
@@ -1600,6 +1722,12 @@ private:
             else { ++it; }
         }
     }
+    // Optional knobs
+    double root_noise_eps_ = 0.0;
+    bool   adversarial_select_root_ = false;
+    double c_puct_ = 1.2;
+    int    K0_ = 6;
+    double K1_ = 1.5;
 };
 
 // -----------------------------
@@ -1619,5 +1747,7 @@ PYBIND11_MODULE(student_agent_module, m) {
         .def_readonly("orientation", &Move::orientation);
     py::class_<StudentAgent>(m, "StudentAgent")
         .def(py::init<std::string>())
-        .def("choose", &StudentAgent::choose);
+        .def("choose", &StudentAgent::choose)
+        .def("evaluate", &StudentAgent::evaluate,
+             py::arg("board"), py::arg("rows"), py::arg("cols"), py::arg("score_cols"), py::arg("side"), py::arg("time_limit"));
 }
