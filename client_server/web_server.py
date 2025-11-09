@@ -52,6 +52,15 @@ class GameCoordinator:
         else:
             rows, cols = 13, 12
             
+        # Set time per player based on board size (minutes):
+        # small: 2 min, medium: 3 min, large: 4 min
+        if board_size == "small":
+            time_left = 2 * 60.0
+        elif board_size == "medium":
+            time_left = 3 * 60.0
+        else:
+            time_left = 4 * 60.0
+
         # Initialize game state
         board = default_start_board(rows, cols)
         score_cols = score_cols_for(cols)
@@ -67,8 +76,8 @@ class GameCoordinator:
             "win_count": win_count,
             "current_player": "circle",
             "players": {
-                "circle": {"connected": False, "port": 8181, "time_left": 60.0},
-                "square": {"connected": False, "port": 8182, "time_left": 60.0}
+                "circle": {"connected": False, "port": 8181, "time_left": time_left},
+                "square": {"connected": False, "port": 8182, "time_left": time_left}
             },
             "game_status": "waiting",  # waiting, active, finished
             "winner": None,
