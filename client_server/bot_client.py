@@ -270,6 +270,31 @@ class BotClient:
             logger.error("Failed to connect to server")
             return
         
+        def _flush_pending_rows(pending_rows, game_state, last_board_pieces, log_path):
+            if not pending_rows:
+                return
+            try:
+                from gameEngine import compute_final_scores
+                scores = None
+                # If we have a finished state, compute official scores from its board
+                if game_state and game_state.get('game_status') == 'finished':
+                    final_board = last_board_pieces if last_board_pieces is not None else self.convert_board_format(game_state["board"])
+                    scores = compute_final_scores(final_board, game_state.get('winner'), game_state["rows"], game_state["cols"], game_state["score_cols"],
+                                                  remaining_times={
+                                                      'circle': game_state.get('players', {}).get('circle', {}).get('time_left', 0.0),
+                                                      'square': game_state.get('players', {}).get('square', {}).get('time_left', 0.0),
+                                                  } if isinstance(game_state.get('players'), dict) else None)
+                # Ensure logs dir exists
+                os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                with open(log_path, 'a') as f:
+                    for row in pending_rows:
+                        if scores is not None:
+                            row['final_score_from_side'] = float(scores.get(row['side'], 0.0))
+                        f.write(json.dumps(row) + "\n")
+                logger.info(f"Wrote {len(pending_rows)} rows to {log_path}")
+            except Exception as e:
+                logger.error(f"Failed to flush training rows: {e}")
+
         try:
             # Prepare logging (optional). Set RS_LOG_VALUE=1 to enable.
             enable_log = os.environ.get('RS_LOG_VALUE', '0') == '1'
@@ -295,24 +320,9 @@ class BotClient:
                 
                 if game_state["game_status"] == "finished":
                     logger.info("Game finished!")
-                    # Fetch final board for labeling (use last seen if needed)
-                    final_board = last_board_pieces if last_board_pieces is not None else self.convert_board_format(game_state["board"])
                     if enable_log and pending_rows:
-                        try:
-                            # Compute final tournament scores
-                            from gameEngine import compute_final_scores
-                            scores = compute_final_scores(final_board, None, game_state["rows"], game_state["cols"], game_state["score_cols"])
-                            # Assign labels and flush
-                            os.makedirs(os.path.dirname(log_path), exist_ok=True)
-                            with open(log_path, 'a') as f:
-                                for row in pending_rows:
-                                    row['final_score_from_side'] = float(scores.get(row['side'], 0.0))
-                                    f.write(json.dumps(row) + "\n")
-                            logger.info(f"Wrote {len(pending_rows)} rows to {log_path}")
-                        except Exception as e:
-                            logger.error(f"Failed to write training rows: {e}")
-                        finally:
-                            pending_rows.clear()
+                        _flush_pending_rows(pending_rows, game_state, last_board_pieces, log_path)
+                        pending_rows.clear()
                     break
                 
                 if not game_state["your_turn"]:
@@ -383,6 +393,16 @@ class BotClient:
         except Exception as e:
             logger.error(f"Unexpected error in game loop: {e}")
         finally:
+            # On exit, best-effort flush of pending rows (even if game didn't report finished)
+            if os.environ.get('RS_LOG_VALUE', '0') == '1' and pending_rows:
+                # Try to read final state one last time
+                gs = None
+                try:
+                    gs = self.get_game_state()
+                except Exception:
+                    gs = None
+                _flush_pending_rows(pending_rows, gs, last_board_pieces, log_path)
+                pending_rows.clear()
             # Disconnect from server
             self.disconnect()
 

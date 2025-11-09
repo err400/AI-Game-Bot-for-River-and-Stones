@@ -232,7 +232,8 @@ static vector<Move> generate_all_moves(const Board& board,int row,int col){
         if(is_opponent_score_cell_dyn(nx,ny, owner_to_string(owner))) continue;
         if(board[nx][ny].side==SIDE_EMPTY || board[nx][ny].side!=SIDE_STONE) continue;
         if(nx2<0||nx2>=rows||ny2<0||ny2>=cols) continue;
-        if(is_opponent_score_cell_dyn(nx2,ny2, owner_to_string(board[nx][ny].owner))) continue;
+        // Do not allow pushing into opponent score cells (relative to the mover)
+        if(is_opponent_score_cell_dyn(nx2,ny2, owner_to_string(owner))) continue;
         if(board[nx2][ny2].side!=SIDE_EMPTY) continue;
         if(side==SIDE_STONE) moves.push_back({"push", {row,col}, {nx,ny}, {nx2,ny2}, ""});
         else if(side==SIDE_RIVER){

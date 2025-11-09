@@ -207,9 +207,12 @@ def main():
     if args.use_duplicate_cpp and "duplicate" in args.matchups:
         build_duplicate_student_cpp_if_needed()
 
-    # Ensure logs dir exists if logging
+    # Ensure logs file exists if logging (helps tail -f before first flush)
     if args.log:
-        Path(args.log_path).parent.mkdir(parents=True, exist_ok=True)
+        p = Path(args.log_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if not p.exists():
+            p.touch()
 
     # Start server
     srv = start_server(args.port)
