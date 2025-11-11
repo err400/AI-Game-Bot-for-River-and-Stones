@@ -1,0 +1,135 @@
+=== Step 0: Build student agent (C++) ===
+rm -rf build
+mkdir -p build
+cd build && cmake .. -Dpybind11_DIR="/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/site-packages/pybind11/share/cmake/pybind11" -DPYBIND11_FINDPYTHON=ON -DCMAKE_C_COMPILER="cc" -DCMAKE_CXX_COMPILER="c++" -DCMAKE_BUILD_TYPE=Release
+-- The C compiler identification is AppleClang 15.0.0.15000100
+-- The CXX compiler identification is AppleClang 15.0.0.15000100
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Found Python: /Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12 (found suitable version "3.12.1", minimum required is "3.8") found components: Interpreter Development.Module Development.Embed
+-- Performing Test HAS_FLTO_THIN
+-- Performing Test HAS_FLTO_THIN - Success
+-- Performing Test HAS_FLTO
+-- Performing Test HAS_FLTO - Success
+-- Found pybind11: /Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/site-packages/pybind11/include (found version "3.0.1")
+-- Configuring done (2.2s)
+-- Generating done (0.0s)
+-- Build files have been written to: /Users/yuvikachaudhary/Desktop/Semester 5/COL333/COL333_A5/build
+cmake --build build --config Release -j
+[ 50%] Building CXX object CMakeFiles/student_agent_module.dir/student_agent.cpp.o
+[100%] Linking CXX shared module student_agent_module.cpython-312-darwin.so
+[100%] Built target student_agent_module
+Built CMake module in build/
+=== Step 1: Generate diverse game data (this can take time) ===
+SIZES=small medium MATCHUPS=self greedy random GAMES_PER_SIZE=10 RS_TIME_CAP=0.30
+rm -rf build
+mkdir -p build
+cd build && cmake .. -Dpybind11_DIR="/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/site-packages/pybind11/share/cmake/pybind11" -DPYBIND11_FINDPYTHON=ON -DCMAKE_C_COMPILER="cc" -DCMAKE_CXX_COMPILER="c++" -DCMAKE_BUILD_TYPE=Release
+-- The C compiler identification is AppleClang 15.0.0.15000100
+-- The CXX compiler identification is AppleClang 15.0.0.15000100
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Found Python: /Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12 (found suitable version "3.12.1", minimum required is "3.8") found components: Interpreter Development.Module Development.Embed
+-- Performing Test HAS_FLTO_THIN
+-- Performing Test HAS_FLTO_THIN - Success
+-- Performing Test HAS_FLTO
+-- Performing Test HAS_FLTO - Success
+-- Found pybind11: /Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/site-packages/pybind11/include (found version "3.0.1")
+-- Configuring done (1.6s)
+-- Generating done (0.0s)
+-- Build files have been written to: /Users/yuvikachaudhary/Desktop/Semester 5/COL333/COL333_A5/build
+cmake --build build --config Release -j
+[ 50%] Building CXX object CMakeFiles/student_agent_module.dir/student_agent.cpp.o
+[100%] Linking CXX shared module student_agent_module.cpython-312-darwin.so
+[100%] Built target student_agent_module
+Built CMake module in build/
+WARNING:__main__:Warning: circle player typically uses port 8181, but using 8080
+WARNING:__main__:Warning: square player typically uses port 8182, but using 8080
+INFO:__main__:Initialized greedy_river bot for player square
+INFO:__main__:Starting game loop for square using greedy_river strategy
+INFO:__main__:Successfully connected as square
+INFO:__main__:Waiting for game to start...
+INFO:__main__:Waiting for opponent to connect...
+INFO:__main__:Initialized student_cpp bot for player circle
+INFO:__main__:Starting game loop for circle using student_cpp strategy
+INFO:__main__:Successfully connected as circle
+INFO:__main__:Waiting for game to start...
+INFO:__main__:My turn! Time left: 120.0s
+INFO:__main__:Agent chose move (thinking time: 0.30s): {'action': 'flip', 'from': [3, 8], 'to': [3, 8], 'pushed_to': [], 'orientation': 'vertical'}
+INFO:__main__:Move successful: {'action': 'flip', 'from': [3, 8], 'to': [3, 8], 'pushed_to': [], 'orientation': 'vertical'}
+INFO:__main__:policy_log: K=48 idx=-1 visits=yes
+INFO:__main__:Move sent successfully
+INFO:__main__:My turn! Time left: 120.0s
+INFO:__main__:Agent chose move (thinking time: 0.00s): {'action': 'move', 'from': [7, 4], 'orientation': '', 'pushed_to': [], 'to': [7, 5]}
+INFO:__main__:Move successful: {'action': 'move', 'from': [7, 4], 'orientation': '', 'pushed_to': [], 'to': [7, 5]}
+INFO:__main__:Move sent successfully
+INFO:__main__:My turn! Time left: 119.7s
+INFO:__main__:Agent chose move (thinking time: 0.30s): {'action': 'move', 'from': [3, 8], 'to': [3, 7], 'pushed_to': [], 'orientation': ''}
+INFO:__main__:Move successful: {'action': 'move', 'from': [3, 8], 'to': [3, 7], 'pushed_to': [], 'orientation': ''}
+INFO:__main__:policy_log: K=63 idx=0 visits=yes
+INFO:__main__:Move sent successfully
+INFO:__main__:My turn! Time left: 119.0s
+INFO:__main__:Agent chose move (thinking time: 0.00s): {'action': 'move', 'from': [7, 5], 'orientation': '', 'pushed_to': [], 'to': [7, 6]}
+INFO:__main__:Move successful: {'action': 'move', 'from': [7, 5], 'orientation': '', 'pushed_to': [], 'to': [7, 6]}
+INFO:__main__:Move sent successfully
+INFO:__main__:My turn! Time left: 118.8s
+INFO:__main__:Agent chose move (thinking time: 0.30s): {'action': 'flip', 'from': [8, 8], 'to': [8, 8], 'pushed_to': [], 'orientation': 'vertical'}
+INFO:__main__:Move successful: {'action': 'flip', 'from': [8, 8], 'to': [8, 8], 'pushed_to': [], 'orientation': 'vertical'}
+INFO:__main__:policy_log: K=51 idx=-1 visits=yes
+INFO:__main__:Move sent successfully
+INFO:__main__:My turn! Time left: 118.4s
+INFO:__main__:Agent chose move (thinking time: 0.00s): {'action': 'move', 'from': [7, 3], 'orientation': '', 'pushed_to': [], 'to': [7, 4]}
+INFO:__main__:Move successful: {'action': 'move', 'from': [7, 3], 'orientation': '', 'pushed_to': [], 'to': [7, 4]}
+INFO:__main__:Move sent successfully
+INFO:__main__:My turn! Time left: 117.6s
+INFO:__main__:Agent chose move (thinking time: 0.30s): {'action': 'move', 'from': [3, 7], 'to': [3, 6], 'pushed_to': [], 'orientation': ''}
+INFO:__main__:Move successful: {'action': 'move', 'from': [3, 7], 'to': [3, 6], 'pushed_to': [], 'orientation': ''}
+INFO:__main__:policy_log: K=64 idx=3 visits=yes
+INFO:__main__:Move sent successfully
+INFO:__main__:My turn! Time left: 118.0s
+INFO:__main__:Agent chose move (thinking time: 0.00s): {'action': 'move', 'from': [4, 4], 'orientation': '', 'pushed_to': [], 'to': [4, 5]}
+INFO:__main__:Move successful: {'action': 'move', 'from': [4, 4], 'orientation': '', 'pushed_to': [], 'to': [4, 5]}
+INFO:__main__:Move sent successfully
+INFO:__main__:My turn! Time left: 117.1s
+INFO:__main__:Agent chose move (thinking time: 0.30s): {'action': 'move', 'from': [3, 6], 'to': [3, 5], 'pushed_to': [], 'orientation': ''}
+INFO:__main__:Move successful: {'action': 'move', 'from': [3, 6], 'to': [3, 5], 'pushed_to': [], 'orientation': ''}
+INFO:__main__:policy_log: K=64 idx=3 visits=yes
+INFO:__main__:Move sent successfully
+INFO:__main__:My turn! Time left: 117.0s
+INFO:__main__:Agent chose move (thinking time: 0.00s): {'action': 'move', 'from': [6, 4], 'orientation': '', 'pushed_to': [], 'to': [6, 5]}
+INFO:__main__:Move successful: {'action': 'move', 'from': [6, 4], 'orientation': '', 'pushed_to': [], 'to': [6, 5]}
+INFO:__main__:Move sent successfully
+INFO:__main__:My turn! Time left: 116.2s
+INFO:__main__:Agent chose move (thinking time: 0.30s): {'action': 'flip', 'from': [3, 9], 'to': [3, 9], 'pushed_to': [], 'orientation': 'vertical'}
+INFO:__main__:Move successful: {'action': 'flip', 'from': [3, 9], 'to': [3, 9], 'pushed_to': [], 'orientation': 'vertical'}
+INFO:__main__:policy_log: K=68 idx=-1 visits=yes
+INFO:__main__:Move sent successfully
+INFO:__main__:My turn! Time left: 116.3s
+INFO:__main__:Agent chose move (thinking time: 0.00s): {'action': 'move', 'from': [5, 4], 'orientation': '', 'pushed_to': [], 'to': [5, 5]}
+INFO:__main__:Move successful: {'action': 'move', 'from': [5, 4], 'orientation': '', 'pushed_to': [], 'to': [5, 5]}
+INFO:__main__:Move sent successfully
+INFO:__main__:My turn! Time left: 115.0s
+INFO:__main__:Agent chose move (thinking time: 0.30s): {'action': 'move', 'from': [3, 5], 'to': [2, 5], 'pushed_to': [], 'orientation': ''}
+INFO:__main__:Move successful: {'action': 'move', 'from': [3, 5], 'to': [2, 5], 'pushed_to': [], 'orientation': ''}
+INFO:__main__:policy_log: K=77 idx=0 visits=yes
+INFO:__main__:Move sent successfully
+INFO:__main__:My turn! Time left: 116.0s
+INFO:__main__:Agent chose move (thinking time: 0.00s): {'action': 'move', 'from': [4, 5], 'orientation': '', 'pushed_to': [], 'to': [4, 6]}
+INFO:__main__:Move successful: {'action': 'move', 'from': [4, 5], 'orientation': '', 'pushed_to': [], 'to': [4, 6]}
+INFO:__main__:Move sent successfully

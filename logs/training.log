@@ -1,0 +1,10 @@
+=== Step 3: Train value model ===
+/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/site-packages/numpy/lib/_function_base_impl.py:3065: RuntimeWarning: invalid value encountered in divide
+  c /= stddev[:, None]
+Trained on 1809 rows (bad lines: 0)
+Primary value: MAE=0.0000, Pearson r=nan, L2=0.001
+Aux points  : MAE=0.0150, Pearson r=0.4720, weight=0.3
+Wrote primary value weights to /Users/yuvikachaudhary/Desktop/Semester 5/COL333/COL333_A5/models/value_v1.txt (len=16)
+=== Step 3b: Non-zero weights check ===
+Weights non-zero: 0 / 15
+[WARN] All weights are zero — likely homogeneous targets. Generate more diverse data and rerun.
