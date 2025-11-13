@@ -222,6 +222,38 @@ class GameCoordinator:
             game["rows"], game["cols"], game["score_cols"]
         )
         
+        if not success:
+            # Invalid move - player who made invalid move loses
+            winner = "square" if player == "circle" else "circle"
+            game["winner"] = winner
+            game["game_status"] = "finished"
+            game["invalid_move_player"] = player
+            game["invalid_move_reason"] = message
+            
+            # Calculate final scores with penalty for invalid move
+            final_scores = compute_final_scores(
+                game["board"], winner, game["rows"], game["cols"], game["score_cols"],
+                remaining_times={
+                    "circle": game["players"]["circle"]["time_left"],
+                    "square": game["players"]["square"]["time_left"]
+                }
+            )
+            game["final_scores"] = final_scores
+            
+            logger.error(f"INVALID MOVE by {player}: {message}")
+            logger.info(f"Game finished! Winner: {winner} (opponent made invalid move)")
+            
+            # Broadcast update to web clients
+            self._broadcast_game_update(game)
+            
+            return {
+                "success": False, 
+                "message": f"Invalid move: {message}",
+                "winner": winner,
+                "invalid_move": True,
+                "invalid_player": player
+            }
+        
         if success:
             # Log the move
             game["game_log"].append({

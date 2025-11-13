@@ -568,8 +568,43 @@
             
             let content = '';
             
+            // Check for invalid move
+            if (gameState.invalid_move_player) {
+                const invalidPlayer = gameState.invalid_move_player;
+                const invalidReason = gameState.invalid_move_reason || "Unknown reason";
+                let invalidSymbol = invalidPlayer === 'circle' ? '🔴' : '🔵';
+                let invalidName = invalidPlayer.charAt(0).toUpperCase() + invalidPlayer.slice(1);
+                let winnerSymbol = winner === 'circle' ? '🔴' : '🔵';
+                let winnerName = winner.charAt(0).toUpperCase() + winner.slice(1);
+                
+                content = `
+                    <h2>❌ Invalid Move! Game Over ❌</h2>
+                    <p style="font-size: 1.3em; margin: 15px 0; color: #dc3545; font-weight: bold;">
+                        ${invalidSymbol} ${invalidName} made an INVALID move!
+                    </p>
+                    <p style="font-size: 1em; margin: 10px 0; color: #721c24; background: #f8d7da; padding: 10px; border-radius: 5px;">
+                        <strong>Reason:</strong> ${invalidReason}
+                    </p>
+                    <h3 style="margin-top: 20px;">🎉 ${winnerSymbol} ${winnerName} Wins by Disqualification! 🎉</h3>
+                    <div style="display: flex; justify-content: center; gap: 30px; margin-top: 15px;">
+                        <div style="${winner === 'circle' ? 'transform: scale(1.1);' : ''}">
+                            <p style="font-size: 1.3em; font-weight: bold;">🔴 Circle</p>
+                            <p style="font-size: 1.8em; font-weight: bold; ${winner === 'circle' ? 'color: #d68910;' : ''}">${circleScore.toFixed(1)}</p>
+                            ${winner === 'circle' ? '<p style="font-size: 0.9em;">👑 Winner</p>' : '<p style="font-size: 0.9em;">❌ Disqualified</p>'}
+                        </div>
+                        <div style="font-size: 2em; align-self: center;">vs</div>
+                        <div style="${winner === 'square' ? 'transform: scale(1.1);' : ''}">
+                            <p style="font-size: 1.3em; font-weight: bold;">🔵 Square</p>
+                            <p style="font-size: 1.8em; font-weight: bold; ${winner === 'square' ? 'color: #d68910;' : ''}">${squareScore.toFixed(1)}</p>
+                            ${winner === 'square' ? '<p style="font-size: 0.9em;">👑 Winner</p>' : '<p style="font-size: 0.9em;">❌ Disqualified</p>'}
+                        </div>
+                    </div>
+                `;
+                addLogEntry(`GAME OVER! ${invalidSymbol} ${invalidName} made an INVALID MOVE: ${invalidReason}`);
+                addLogEntry(`Winner: ${winnerSymbol} ${winnerName} (by disqualification)`);
+            }
             // Check for stalemate/draw (winner is null/None or scores are equal)
-            if (winner === null || winner === 'tie' || circleScore === squareScore) {
+            else if (winner === null || winner === 'tie' || circleScore === squareScore) {
                 // It's a tie/draw/stalemate
                 content = `
                     <h2>🤝 It's a Draw! 🤝</h2>
