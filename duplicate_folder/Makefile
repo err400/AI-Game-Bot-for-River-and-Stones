@@ -139,3 +139,44 @@ rebuild-run: cmake-rebuild run
 rebuild-run-aivai: cmake-rebuild run-aivai
 rebuild-run-hvai: cmake-rebuild run-hvai
 rebuild-run-hvh: cmake-rebuild run-hvh
+
+##############################################
+# Greedy River Agent build (direct pybind)
+##############################################
+.PHONY: greedy-build greedy-test-import greedy-clean
+
+# Build Python extension into build_greedy/greedy_river_module<ext>
+GREEDY_BUILD_DIR := build_greedy
+GREEDY_SRC := greedy_river_agent.cpp
+
+greedy-build: $(GREEDY_BUILD_DIR)/greedy_river_module$(shell $(PY) -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX') or '.so')")
+
+$(GREEDY_BUILD_DIR)/greedy_river_module%: $(GREEDY_SRC) | $(GREEDY_BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $$($(PY) -m pybind11 --includes) -o $@ $< $(LDFLAGS)
+	@echo "Built: $@"
+
+$(GREEDY_BUILD_DIR):
+	mkdir -p $(GREEDY_BUILD_DIR)
+
+greedy-test-import: greedy-build
+	@$(PY) -c "import sys,importlib; sys.path.insert(0, '$(GREEDY_BUILD_DIR)'); m=importlib.import_module('greedy_river_module'); print('Greedy module OK:', m)"
+
+greedy-clean:
+	rm -rf $(GREEDY_BUILD_DIR)
+
+##############################################
+# Web server + Greedy bot helpers
+##############################################
+.PHONY: web-server bot-greedy-circle bot-greedy-square
+
+PORT ?= 8080
+HOST ?= localhost
+
+web-server:
+	PYTHONPATH=. $(PY) client_server/web_server.py $(PORT)
+
+bot-greedy-circle: greedy-build
+	PYTHONPATH=. $(PY) client_server/bot_client.py circle $(PORT) --server $(HOST) --strategy greedy_river
+
+bot-greedy-square: greedy-build
+	PYTHONPATH=. $(PY) client_server/bot_client.py square $(PORT) --server $(HOST) --strategy greedy_river

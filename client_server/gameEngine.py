@@ -89,6 +89,20 @@ def save_board_to_file(board, path:str):
     with open(path,"w",encoding="utf-8") as fh:
         json.dump(data, fh, indent=2)
 
+def board_to_hash(board:List[List[Optional[Piece]]]) -> str:
+    """Convert board state to a hashable string for stalemate detection."""
+    state = []
+    for row in board:
+        row_state = []
+        for cell in row:
+            if cell is None:
+                row_state.append("_")
+            else:
+                # Format: owner_side_orientation (e.g., "circle_stone_None" or "square_river_horizontal")
+                row_state.append(f"{cell.owner}_{cell.side}_{cell.orientation}")
+        state.append("|".join(row_state))
+    return "||".join(state)
+
 # ---------------- Score helpers ----------------
 def score_cols_for(cols:int) -> List[int]:
     # Scale scoring area width with board size
@@ -178,9 +192,11 @@ def compute_final_scores(board:List[List[Optional[Piece]]],
     If remaining_times provided (dict with keys 'circle' and 'square' containing remaining time),
     then if one player's clock is <= 0 and the other player's clock > 0 the latter is declared winner.
     Implements the scoring rules from the spec:
-      - Victory: winner gets 100 - (n_lose + m_lose/10), loser gets (n_lose + m_lose/10)
+      - Victory: Total Score = 1_[Win] * 100 + W * (1_[Lose] - 1_[Win]) * (n_Lose + m_Lose/n_total)
+        where W = 10 for 13x12, W = 8 for 15x14, W = 6.5 for 17x16
+        and n_total = total pieces per player (12, 14, or 16)
       - Draw: each player gets DrawScore (30) + MarginScore/4
-        where MarginScore = 39 + ((n_self + m_self/10) - (n_opp + m_opp/10))
+        where MarginScore = 39 + ((n_self + m_self/n_total) - (n_opp + m_opp/n_total))
     """
     # If a remaining_times dict is passed and no winner was set, derive winner from clocks
     if remaining_times is not None and winner is None:
@@ -193,6 +209,17 @@ def compute_final_scores(board:List[List[Optional[Piece]]],
                 winner = 'circle'
             # if both <= 0 or both > 0 -> leave winner as-is (None or previously set)
 
+    # Determine W and n_total based on board size
+    if cols <= 12:
+        W = 10.0
+        n_total = 12
+    elif cols <= 14:
+        W = 8.0
+        n_total = 14
+    else:
+        W = 6.5
+        n_total = 16
+
     # helper to obtain n and m for a player or opponent
     def nm_for(player):
         n = count_scoring_pieces(board, player, rows, cols, score_cols)
@@ -203,7 +230,7 @@ def compute_final_scores(board:List[List[Optional[Piece]]],
     if winner in ("circle", "square"):
         loser = opponent(winner)
         n_loser, m_loser = nm_for(loser)
-        loser_score = float(n_loser) + float(m_loser) / 10.0
+        loser_score = W * (float(n_loser) + float(m_loser) / float(n_total))
         winner_score = 100.0 - loser_score
         scores[winner] = winner_score
         scores[loser] = loser_score
@@ -213,7 +240,7 @@ def compute_final_scores(board:List[List[Optional[Piece]]],
         for player in ("circle", "square"):
             n_self, m_self = nm_for(player)
             n_opp, m_opp = nm_for(opponent(player))
-            margin = 39.0 + ((float(n_self) + float(m_self)/10.0) - (float(n_opp) + float(m_opp)/10.0))
+            margin = 39.0 + ((float(n_self) + float(m_self)/float(n_total)) - (float(n_opp) + float(m_opp)/float(n_total)))
             total = DRAW_SCORE + margin / 4.0
             scores[player] = total
     return scores
@@ -772,7 +799,6 @@ def run_gui(mode:str, circle_strategy:str, square_strategy:str, load_file:Option
     elif mode=="hvh": players={"circle":"human","square":"human"}
     else:
         if circle_strategy=="random": players={"circle":"ai","square":"human"}
-        elif circle_strategy=="student_cpp": players={"circle":"ai","square":"human"}
         else: players={"circle":"human","square":"ai"}
     
     # instantiate agents (they only receive board)
@@ -796,6 +822,10 @@ def run_gui(mode:str, circle_strategy:str, square_strategy:str, load_file:Option
     game_over = False
 
     turn_start = time.time()
+    
+    # Stalemate detection: track board states after every 4 moves (2 per player)
+    board_state_history = []
+    moves_since_last_check = 0
 
     while True:
         clock.tick(FPS)
@@ -832,8 +862,24 @@ def run_gui(mode:str, circle_strategy:str, square_strategy:str, load_file:Option
                     ok, info = validate_and_apply_move(board, move, current, rows, cols, score_cols)
                     msg = f"AI {current}: {info}"
                     if ok:
+                        moves_since_last_check += 1
                         w = check_win(board, rows, cols, score_cols)
                         if w: winner = w; msg = f"{w.title()} wins!"; game_over = True
+                        
+                        # Check for stalemate after every 4 moves (2 per player)
+                        if not game_over and moves_since_last_check >= 4:
+                            current_state = board_to_hash(board)
+                            board_state_history.append(current_state)
+                            moves_since_last_check = 0
+                            
+                            # Check if current state has appeared 3 times consecutively
+                            if len(board_state_history) >= 3:
+                                if (board_state_history[-1] == board_state_history[-2] == board_state_history[-3]):
+                                    winner = None
+                                    game_over = True
+                                    msg = "Stalemate detected (board repeated 3 times). Game ends in a draw!"
+                                    print("Stalemate: Board state repeated 3 times consecutively.")
+                        
                         current = opponent(current)
                         selected=None; highlights=set(); action_mode=None; push_stage=None; push_candidate=None
                         turn_start = time.time()  # NEW: reset timer when switching to next (human) turn
@@ -879,8 +925,24 @@ def run_gui(mode:str, circle_strategy:str, square_strategy:str, load_file:Option
                         ok,info = validate_and_apply_move(board,m,current,rows,cols,score_cols)
                         msg = info
                         if ok:
+                            moves_since_last_check += 1
                             w = check_win(board, rows, cols, score_cols)
                             if w: winner=w; msg = f"{w.title()} wins!"; game_over = True
+                            
+                            # Check for stalemate after every 4 moves (2 per player)
+                            if not game_over and moves_since_last_check >= 4:
+                                current_state = board_to_hash(board)
+                                board_state_history.append(current_state)
+                                moves_since_last_check = 0
+                                
+                                # Check if current state has appeared 3 times consecutively
+                                if len(board_state_history) >= 3:
+                                    if (board_state_history[-1] == board_state_history[-2] == board_state_history[-3]):
+                                        winner = None
+                                        game_over = True
+                                        msg = "Stalemate detected (board repeated 3 times). Game ends in a draw!"
+                                        print("Stalemate: Board state repeated 3 times consecutively.")
+                            
                             current = opponent(current); selected=None; highlights=set(); action_mode=None
                     else:
                         msg = "Rotate needs selected river piece"
@@ -892,16 +954,48 @@ def run_gui(mode:str, circle_strategy:str, square_strategy:str, load_file:Option
                         ok,info = validate_and_apply_move(board,m,current,rows,cols,score_cols)
                         msg = info
                         if ok:
+                            moves_since_last_check += 1
                             w = check_win(board, rows, cols, score_cols)
                             if w: winner=w; msg = f"{w.title()} wins!"; game_over = True
+                            
+                            # Check for stalemate after every 4 moves (2 per player)
+                            if not game_over and moves_since_last_check >= 4:
+                                current_state = board_to_hash(board)
+                                board_state_history.append(current_state)
+                                moves_since_last_check = 0
+                                
+                                # Check if current state has appeared 3 times consecutively
+                                if len(board_state_history) >= 3:
+                                    if (board_state_history[-1] == board_state_history[-2] == board_state_history[-3]):
+                                        winner = None
+                                        game_over = True
+                                        msg = "Stalemate detected (board repeated 3 times). Game ends in a draw!"
+                                        print("Stalemate: Board state repeated 3 times consecutively.")
+                            
                             current = opponent(current); selected=None; highlights=set(); action_mode=None
                     elif ev.key == pygame.K_f:
                         m={"action":"flip","from":[sx,sy]}
                         ok,info = validate_and_apply_move(board,m,current,rows,cols,score_cols)
                         msg = info
                         if ok:
+                            moves_since_last_check += 1
                             w = check_win(board, rows, cols, score_cols)
                             if w: winner=w; msg = f"{w.title()} wins!"; game_over = True
+                            
+                            # Check for stalemate after every 4 moves (2 per player)
+                            if not game_over and moves_since_last_check >= 4:
+                                current_state = board_to_hash(board)
+                                board_state_history.append(current_state)
+                                moves_since_last_check = 0
+                                
+                                # Check if current state has appeared 3 times consecutively
+                                if len(board_state_history) >= 3:
+                                    if (board_state_history[-1] == board_state_history[-2] == board_state_history[-3]):
+                                        winner = None
+                                        game_over = True
+                                        msg = "Stalemate detected (board repeated 3 times). Game ends in a draw!"
+                                        print("Stalemate: Board state repeated 3 times consecutively.")
+                            
                             current = opponent(current); selected=None; highlights=set(); action_mode=None
 
             if ev.type == pygame.MOUSEBUTTONDOWN and ev.button==1:
@@ -943,8 +1037,24 @@ def run_gui(mode:str, circle_strategy:str, square_strategy:str, load_file:Option
                             ok,info = validate_and_apply_move(board,m,current,rows,cols,score_cols)
                             msg = info
                             if ok:
+                                moves_since_last_check += 1
                                 w = check_win(board,rows,cols,score_cols)
                                 if w: winner=w; msg=f"{w.title()} wins!"; game_over=True
+                                
+                                # Check for stalemate after every 4 moves (2 per player)
+                                if not game_over and moves_since_last_check >= 4:
+                                    current_state = board_to_hash(board)
+                                    board_state_history.append(current_state)
+                                    moves_since_last_check = 0
+                                    
+                                    # Check if current state has appeared 3 times consecutively
+                                    if len(board_state_history) >= 3:
+                                        if (board_state_history[-1] == board_state_history[-2] == board_state_history[-3]):
+                                            winner = None
+                                            game_over = True
+                                            msg = "Stalemate detected (board repeated 3 times). Game ends in a draw!"
+                                            print("Stalemate: Board state repeated 3 times consecutively.")
+                                
                                 current = opponent(current)
                                 selected=None; highlights=set(); action_mode=None
                                 push_stage=None; push_candidate=None
@@ -978,8 +1088,24 @@ def run_gui(mode:str, circle_strategy:str, square_strategy:str, load_file:Option
                                     msg=info
                                     push_stage=None; push_candidate=None; highlights=set(); action_mode=None
                                     if ok:
+                                        moves_since_last_check += 1
                                         w = check_win(board,rows,cols,score_cols)
                                         if w: winner=w; msg=f"{w.title()} wins!"; game_over=True
+                                        
+                                        # Check for stalemate after every 4 moves (2 per player)
+                                        if not game_over and moves_since_last_check >= 4:
+                                            current_state = board_to_hash(board)
+                                            board_state_history.append(current_state)
+                                            moves_since_last_check = 0
+                                            
+                                            # Check if current state has appeared 3 times consecutively
+                                            if len(board_state_history) >= 3:
+                                                if (board_state_history[-1] == board_state_history[-2] == board_state_history[-3]):
+                                                    winner = None
+                                                    game_over = True
+                                                    msg = "Stalemate detected (board repeated 3 times). Game ends in a draw!"
+                                                    print("Stalemate: Board state repeated 3 times consecutively.")
+                                        
                                         current = opponent(current)
                                         selected=None
                                         turn_start = time.time()  # NEW
@@ -991,8 +1117,24 @@ def run_gui(mode:str, circle_strategy:str, square_strategy:str, load_file:Option
                             ok,info = validate_and_apply_move(board,m,current,rows,cols,score_cols)
                             msg=info
                             if ok:
+                                moves_since_last_check += 1
                                 w = check_win(board,rows,cols,score_cols)
                                 if w: winner=w; msg=f"{w.title()} wins!"; game_over=True
+                                
+                                # Check for stalemate after every 4 moves (2 per player)
+                                if not game_over and moves_since_last_check >= 4:
+                                    current_state = board_to_hash(board)
+                                    board_state_history.append(current_state)
+                                    moves_since_last_check = 0
+                                    
+                                    # Check if current state has appeared 3 times consecutively
+                                    if len(board_state_history) >= 3:
+                                        if (board_state_history[-1] == board_state_history[-2] == board_state_history[-3]):
+                                            winner = None
+                                            game_over = True
+                                            msg = "Stalemate detected (board repeated 3 times). Game ends in a draw!"
+                                            print("Stalemate: Board state repeated 3 times consecutively.")
+                                
                                 current = opponent(current)
                                 selected=None; action_mode=None
                                 turn_start = time.time()  # NEW
@@ -1010,8 +1152,24 @@ def run_gui(mode:str, circle_strategy:str, square_strategy:str, load_file:Option
                             ok,info = validate_and_apply_move(board,m,current,rows,cols,score_cols)
                             msg=info
                             if ok:
+                                moves_since_last_check += 1
                                 w = check_win(board,rows,cols,score_cols)
                                 if w: winner=w; msg=f"{w.title()} wins!"; game_over=True
+                                
+                                # Check for stalemate after every 4 moves (2 per player)
+                                if not game_over and moves_since_last_check >= 4:
+                                    current_state = board_to_hash(board)
+                                    board_state_history.append(current_state)
+                                    moves_since_last_check = 0
+                                    
+                                    # Check if current state has appeared 3 times consecutively
+                                    if len(board_state_history) >= 3:
+                                        if (board_state_history[-1] == board_state_history[-2] == board_state_history[-3]):
+                                            winner = None
+                                            game_over = True
+                                            msg = "Stalemate detected (board repeated 3 times). Game ends in a draw!"
+                                            print("Stalemate: Board state repeated 3 times consecutively.")
+                                
                                 current = opponent(current)
                                 selected=None; highlights=set(); action_mode=None
                                 turn_start = time.time()  # NEW
@@ -1062,6 +1220,10 @@ def run_cli(mode:str, circle_strategy:str, square_strategy:str, load_file:Option
     
     # Timers (seconds) - ADDED
     timers = {"circle": time_per_player, "square": time_per_player}  # ADDED
+    
+    # Stalemate detection: track board states after every 4 moves (2 per player)
+    board_state_history = []
+    moves_since_last_check = 0
 
     while True:
         print(board_to_ascii(board, rows, cols, score_cols))
@@ -1121,6 +1283,8 @@ def run_cli(mode:str, circle_strategy:str, square_strategy:str, load_file:Option
                     print("Turn limit reached -> draw"); break
                 input("\nPress Enter to continue...")
                 continue
+            else:
+                moves_since_last_check += 1
         else:
             # Human: measure time spent entering the move so the timer decreases
             print("Commands:")
@@ -1157,6 +1321,8 @@ def run_cli(mode:str, circle_strategy:str, square_strategy:str, load_file:Option
             print(f"Result: {msg}")
             if not ok:
                 continue
+            else:
+                moves_since_last_check += 1
             
         # after a successful move / AI move attempt, check board win
         w = check_win(board, rows, cols, score_cols)
@@ -1164,6 +1330,20 @@ def run_cli(mode:str, circle_strategy:str, square_strategy:str, load_file:Option
             winner = w
             print(f"\n🎉 WINNER: {w.upper()} 🎉")
             break
+        
+        # Check for stalemate after every 4 moves (2 per player)
+        if moves_since_last_check >= 4:
+            current_state = board_to_hash(board)
+            board_state_history.append(current_state)
+            moves_since_last_check = 0
+            
+            # Check if current state has appeared 3 times consecutively
+            if len(board_state_history) >= 3:
+                if (board_state_history[-1] == board_state_history[-2] == board_state_history[-3]):
+                    winner = None
+                    print("\n⚠️  STALEMATE: Board state repeated 3 times consecutively.")
+                    print("Game ends in a draw!")
+                    break
 
         # next player's turn
         current = opponent(current)

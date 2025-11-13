@@ -1,0 +1,10 @@
+River and Stones - Grading Summary
+========================================
+
+Total submissions: 1
+Successful submissions: 1
+Failed submissions: 0
+
+SUCCESSFUL SUBMISSIONS:
+-------------------------
+myname: 6/6 runs successful (cpp)

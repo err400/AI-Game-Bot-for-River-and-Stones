@@ -1,6 +1,42 @@
 """
 Web Server for River and Stones Game
 Serves web GUI and handles bot connections
+
+BOT TIMING GUIDE:
+================
+To ensure fair and accurate time tracking, bots should:
+
+1. Request game state: GET /bot/game_state/<player>
+   - Response includes "timestamp" field (server time when state was sent)
+
+2. Calculate thinking time:
+   - start_time = response["timestamp"]  # or time.time() when received
+   - ... perform computation ...
+   - thinking_time = time.time() - start_time
+
+3. Submit move with thinking time: POST /bot/move/<player>
+   {
+       "move": {...},
+       "thinking_time": <float seconds>
+   }
+
+If "thinking_time" is provided, ONLY that amount will be deducted from your clock.
+If not provided, time since last move will be used (includes network latency - less accurate).
+
+Example bot code:
+    # Get game state
+    response = requests.get(f'http://server/bot/game_state/{player}').json()
+    start_time = time.time()  # Start timing
+    
+    # Compute move
+    move = my_agent.choose(response['board'], ...)
+    
+    # Calculate actual thinking time
+    thinking_time = time.time() - start_time
+    
+    # Submit move with thinking time
+    requests.post(f'http://server/bot/move/{player}',
+                  json={"move": move, "thinking_time": thinking_time})
 """
 
 import asyncio
@@ -22,7 +58,7 @@ except ImportError:
 from gameEngine import (
     default_start_board, score_cols_for, get_win_count, 
     validate_and_apply_move, check_win, board_to_ascii,
-    compute_final_scores, Piece
+    compute_final_scores, Piece, board_to_hash
 )
 
 # Configure logging
@@ -52,8 +88,7 @@ class GameCoordinator:
         else:
             rows, cols = 13, 12
             
-        # Set time per player based on board size (minutes):
-        # small: 2 min, medium: 3 min, large: 4 min
+        # Set time per player based on board size (minutes)
         if board_size == "small":
             time_left = 2 * 60.0
         elif board_size == "medium":
@@ -83,7 +118,9 @@ class GameCoordinator:
             "winner": None,
             "turn_count": 0,
             "last_move_time": time.time(),
-            "game_log": []
+            "game_log": [],
+            "board_state_history": [],  # For stalemate detection
+            "moves_since_last_check": 0  # Track moves for stalemate check
         }
         
         self.games[game_id] = game_state
@@ -141,8 +178,15 @@ class GameCoordinator:
         logger.info(f"Bot disconnected from port {port}")
         return True
     
-    def make_move(self, player: str, move: Dict[str, Any]) -> Dict[str, Any]:
-        """Process a move from a bot player"""
+    def make_move(self, player: str, move: Dict[str, Any], thinking_time: float = None) -> Dict[str, Any]:
+        """Process a move from a bot player
+        
+        Args:
+            player: The player making the move ('circle' or 'square')
+            move: The move dictionary
+            thinking_time: Optional - actual time spent by bot thinking (in seconds)
+                          If not provided, falls back to measuring time since last move
+        """
         game = self.get_game()
         if not game:
             return {"success": False, "error": "No active game"}
@@ -154,7 +198,13 @@ class GameCoordinator:
             return {"success": False, "error": "Not your turn"}
         
         # Calculate elapsed time for current player
-        elapsed_time = time.time() - game["last_move_time"]
+        # Prefer actual thinking time from bot to exclude network/processing overhead
+        if thinking_time is not None:
+            elapsed_time = thinking_time
+        else:
+            # Fallback: measure time since last move (includes network latency)
+            elapsed_time = time.time() - game["last_move_time"]
+        
         game["players"][player]["time_left"] -= elapsed_time
         
         # Check for timeout
@@ -182,6 +232,9 @@ class GameCoordinator:
                 "time_left": game["players"][player]["time_left"]
             })
             
+            # Increment move counter for stalemate detection
+            game["moves_since_last_check"] += 1
+            
             # Check for win condition
             winner = check_win(game["board"], game["rows"], game["cols"], game["score_cols"])
             
@@ -199,10 +252,50 @@ class GameCoordinator:
                 game["final_scores"] = final_scores
                 logger.info(f"Game finished! Winner: {winner}")
             else:
-                # Switch to next player
-                game["current_player"] = "square" if player == "circle" else "circle"
-                game["turn_count"] += 1
-                game["last_move_time"] = time.time()
+                # Check for stalemate after every 4 moves (2 per player)
+                if game["moves_since_last_check"] >= 4:
+                    current_state = board_to_hash(game["board"])
+                    game["board_state_history"].append(current_state)
+                    game["moves_since_last_check"] = 0
+                    
+                    # Check if current state has appeared 3 times consecutively
+                    if len(game["board_state_history"]) >= 3:
+                        if (game["board_state_history"][-1] == game["board_state_history"][-2] == game["board_state_history"][-3]):
+                            game["winner"] = None
+                            game["game_status"] = "finished"
+                            # Calculate final scores for stalemate draw
+                            final_scores = compute_final_scores(
+                                game["board"], None, game["rows"], game["cols"], game["score_cols"],
+                                remaining_times={
+                                    "circle": game["players"]["circle"]["time_left"],
+                                    "square": game["players"]["square"]["time_left"]
+                                }
+                            )
+                            game["final_scores"] = final_scores
+                            logger.info("Stalemate detected (board repeated 3 times). Game ends in a draw!")
+                            # Broadcast update to web clients
+                            self._broadcast_game_update(game)
+                            return {"success": True, "message": "Stalemate - board repeated 3 times", "winner": None, "stalemate": True}
+                
+                # Check for turn limit (same as gameEngine.py)
+                if game["turn_count"] >= 1000:
+                    game["winner"] = None
+                    game["game_status"] = "finished"
+                    # Calculate final scores for draw
+                    final_scores = compute_final_scores(
+                        game["board"], None, game["rows"], game["cols"], game["score_cols"],
+                        remaining_times={
+                            "circle": game["players"]["circle"]["time_left"],
+                            "square": game["players"]["square"]["time_left"]
+                        }
+                    )
+                    game["final_scores"] = final_scores
+                    logger.info("Turn limit (1000) reached. Game ends in a draw.")
+                else:
+                    # Switch to next player
+                    game["current_player"] = "square" if player == "circle" else "circle"
+                    game["turn_count"] += 1
+                    game["last_move_time"] = time.time()
             
             # Broadcast update to web clients
             self._broadcast_game_update(game)
@@ -269,7 +362,8 @@ class GameCoordinator:
             "time_left": game["players"][player]["time_left"],
             "opponent_time": game["players"]["square" if player == "circle" else "circle"]["time_left"],
             "game_status": game["game_status"],
-            "turn_count": game["turn_count"]
+            "turn_count": game["turn_count"],
+            "timestamp": time.time()  # Bot can use this to calculate actual thinking time
         }
 
 # Initialize game coordinator
@@ -396,12 +490,25 @@ def get_bot_game_state(player):
 
 @app.route('/bot/move/<player>', methods=['POST'])
 def bot_make_move(player):
-    """Endpoint for bots to make moves"""
+    """Endpoint for bots to make moves
+    
+    Expected JSON format:
+    {
+        "move": {...},           # Required: the move to make
+        "thinking_time": 0.123   # Optional: actual time spent thinking (in seconds)
+    }
+    
+    If thinking_time is provided, it will be used to deduct from player's clock.
+    Otherwise, time since last move will be used (includes network latency).
+    """
     data = request.get_json()
     if not data or 'move' not in data:
         return jsonify({"error": "No move provided"}), 400
     
-    result = coordinator.make_move(player, data['move'])
+    # Extract thinking time if provided by bot
+    thinking_time = data.get('thinking_time')
+    
+    result = coordinator.make_move(player, data['move'], thinking_time)
     return jsonify(result)
 
 # WebSocket events

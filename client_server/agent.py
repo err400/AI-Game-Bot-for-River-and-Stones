@@ -570,13 +570,14 @@ except ImportError:
 
 # ==================== AGENT FACTORY ====================
 
-def get_agent(player: str, strategy: str) -> BaseAgent:
+def get_agent(player: str, strategy: str, custom_agent_path: Optional[str] = None) -> BaseAgent:
     """
     Factory function to create agents based on strategy name.
     
     Args:
         player: "circle" or "square"
-        strategy: Strategy name ("random", "student")
+        strategy: Strategy name ("random", "student", "ta_bot_aggressive", "ta_bot_neutral", "ta_bot_defensive", "custom")
+        custom_agent_path: Path to custom agent.py file (used with "custom" strategy)
     
     Returns:
         Agent instance
@@ -606,5 +607,57 @@ def get_agent(player: str, strategy: str) -> BaseAgent:
         except Exception as e:
             print(f"Greedy river agent unavailable ({e}). Falling back to Python StudentAgent.")
             return StudentAgent(player)
+    elif strategy in ["ta_bot_aggressive", "ta_bot_neutral", "ta_bot_defensive"]:
+        # Load TA bot from A2-grading-material folder
+        import sys
+        import os
+        import importlib.util
+        
+        # Get path to TA bot
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        parent_dir = os.path.dirname(script_dir)
+        ta_agent_path = os.path.join(parent_dir, "A2-grading-material", "agent.py")
+        
+        if not os.path.exists(ta_agent_path):
+            raise FileNotFoundError(f"TA agent not found at: {ta_agent_path}")
+        
+        # Load the module dynamically
+        spec = importlib.util.spec_from_file_location("ta_agent_module", ta_agent_path)
+        ta_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ta_module)
+        
+        # Get the appropriate TA agent class
+        if strategy == "ta_bot_aggressive":
+            TAAgent = ta_module.AggressiveAgent
+            print(f"Loaded Aggressive TA bot from: {ta_agent_path}")
+        elif strategy == "ta_bot_neutral":
+            TAAgent = ta_module.NeutralAgent
+            print(f"Loaded Neutral TA bot from: {ta_agent_path}")
+        else:  # ta_bot_defensive
+            TAAgent = ta_module.DefensiveAgent
+            print(f"Loaded Defensive TA bot from: {ta_agent_path}")
+        
+        return TAAgent(player)
+    elif strategy == "custom":
+        # Load custom agent from specified path
+        import sys
+        import os
+        import importlib.util
+        
+        if not custom_agent_path:
+            raise ValueError("custom_agent_path must be provided when using 'custom' strategy")
+        
+        if not os.path.exists(custom_agent_path):
+            raise FileNotFoundError(f"Custom agent not found at: {custom_agent_path}")
+        
+        # Load the module dynamically
+        spec = importlib.util.spec_from_file_location("custom_agent_module", custom_agent_path)
+        custom_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(custom_module)
+        
+        # Get the StudentAgent class from the custom module
+        CustomAgent = custom_module.StudentAgent
+        print(f"Loaded custom agent from: {custom_agent_path}")
+        return CustomAgent(player)
     else:
-        raise ValueError(f"Unknown strategy: {strategy}. Available: random, student")
+        raise ValueError(f"Unknown strategy: {strategy}. Available: random, student, student_cpp, greedy_river, ta_bot_aggressive, ta_bot_neutral, ta_bot_defensive, custom")

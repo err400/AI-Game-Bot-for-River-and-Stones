@@ -142,76 +142,8 @@ class StudentAgent:
             "pushed_to": list(getattr(m, "pushed_to")),
             "orientation": getattr(m, "orientation"),
         }
-
-        # Smoke-validate with authoritative engine. If invalid, fallback to a legal move.
-        def _engine_generate_all_moves(board_obj, side: str, r: int, c: int, sc: List[int]) -> List[Dict[str, Any]]:
-            """Enumerate legal moves via authoritative engine primitives."""
-            try:
-                try:
-                    from client_server.gameEngine import compute_valid_targets, validate_and_apply_move
-                except Exception:
-                    from gameEngine import compute_valid_targets, validate_and_apply_move  # fallback import
-            except Exception:
-                return []
-
-            moves: List[Dict[str, Any]] = []
-            for y in range(r):
-                for x in range(c):
-                    cell = board_obj[y][x]
-                    if not cell or getattr(cell, 'owner', None) != side:
-                        continue
-                    info = compute_valid_targets(board_obj, x, y, side, r, c, sc)
-                    for (tx, ty) in info.get('moves', set()):
-                        mv = {"action": "move", "from": [x, y], "to": [tx, ty]}
-                        ok2, _ = validate_and_apply_move(copy.deepcopy(board_obj), mv, side, r, c, sc)
-                        if ok2:
-                            moves.append(mv)
-                    for (to_xy, pushed_xy) in info.get('pushes', []):
-                        tx, ty = to_xy
-                        px, py = pushed_xy
-                        mv = {"action": "push", "from": [x, y], "to": [tx, ty], "pushed_to": [px, py]}
-                        ok2, _ = validate_and_apply_move(copy.deepcopy(board_obj), mv, side, r, c, sc)
-                        if ok2:
-                            moves.append(mv)
-                    # Safe flips/rotates are validated on demand
-                    # Try stone->river flips both orientations
-                    for ori in ("horizontal", "vertical"):
-                        mv = {"action": "flip", "from": [x, y], "orientation": ori}
-                        ok2, _ = validate_and_apply_move(copy.deepcopy(board_obj), mv, side, r, c, sc)
-                        if ok2:
-                            moves.append(mv)
-                    # Try river->stone flip
-                    mv = {"action": "flip", "from": [x, y]}
-                    ok2, _ = validate_and_apply_move(copy.deepcopy(board_obj), mv, side, r, c, sc)
-                    if ok2:
-                        moves.append(mv)
-                    # Try rotate
-                    mv = {"action": "rotate", "from": [x, y]}
-                    ok2, _ = validate_and_apply_move(copy.deepcopy(board_obj), mv, side, r, c, sc)
-                    if ok2:
-                        moves.append(mv)
-            return moves
-
-        try:
-            try:
-                from client_server.gameEngine import validate_and_apply_move
-            except Exception:
-                from gameEngine import validate_and_apply_move  # fallback import
-            board_copy = copy.deepcopy(board)
-            ok, _msg = validate_and_apply_move(board_copy, move_dict, self._side, rows, cols, score_cols)
-        except Exception:
-            ok = True  # if engine import fails, trust the move
-
-        if not ok:
-            legal_moves = _engine_generate_all_moves(board, self._side, rows, cols, score_cols)
-            for mv in legal_moves:
-                try:
-                    from client_server.gameEngine import validate_and_apply_move as _v
-                except Exception:
-                    from gameEngine import validate_and_apply_move as _v
-                ok2, _ = _v(copy.deepcopy(board), mv, self._side, rows, cols, score_cols)
-                if ok2:
-                    return mv
+        # Note: Smoke validation removed to avoid any dependency on client_server or TA engine modules.
+        # We now trust the compiled agent's move and return it as-is.
         return move_dict
 
     def evaluate(self, game_state_or_board, rows=None, cols=None, score_cols=None, side=None, time_limit: float = 1.5) -> float:

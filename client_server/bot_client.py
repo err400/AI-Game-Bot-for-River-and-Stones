@@ -33,19 +33,20 @@ logger = logging.getLogger(__name__)
 class BotClient:
     """Client that connects a bot to the game server"""
     
-    def __init__(self, player: str, server_url: str = "http://localhost:8080", strategy: str = "random"):
+    def __init__(self, player: str, server_url: str = "http://localhost:8080", strategy: str = "random", custom_agent_path: Optional[str] = None):
         """
         Initialize bot client
         
         Args:
             player: "circle" or "square"
             server_url: URL of the game server
-            strategy: Bot strategy ("random", "student", etc.)
+            strategy: Bot strategy ("random", "student", "ta_bot", "custom", etc.)
+            custom_agent_path: Path to custom agent.py file (for "custom" strategy)
         """
         self.player = player
         self.server_url = server_url.rstrip('/')
         self.strategy = strategy
-        self.agent = get_agent(player, strategy)
+        self.agent = get_agent(player, strategy, custom_agent_path)
         self.connected = False
         self.game_active = False
         
@@ -115,12 +116,24 @@ class BotClient:
             logger.error(f"Error getting game state: {e}")
             return None
     
-    def make_move(self, move: Dict[str, Any]) -> bool:
-        """Send move to server"""
+    def make_move(self, move: Dict[str, Any], thinking_time: Optional[float] = None) -> bool:
+        """Send move to server.
+
+        If thinking_time is provided (seconds), only that amount will be deducted
+        from our clock server-side; otherwise server uses wall-clock since last state.
+        """
         try:
+            payload = {"move": move}
+            if thinking_time is not None:
+                try:
+                    # Ensure it's a plain float (not numpy types)
+                    payload["thinking_time"] = float(thinking_time)
+                except Exception:
+                    payload["thinking_time"] = thinking_time
+
             response = requests.post(
                 f"{self.server_url}/bot/move/{self.player}",
-                json={"move": move},
+                json=payload,
                 timeout=30
             )
             
@@ -360,8 +373,8 @@ class BotClient:
                         }
                     })
 
-                # Get move from agent
-                start_time = time.time()
+                # Get move from agent; prefer server timestamp for robust timing
+                start_time = game_state.get("timestamp", time.time())
                 move = self.agent.choose(
                     converted_board,
                     game_state["rows"],
@@ -379,8 +392,8 @@ class BotClient:
                 
                 logger.info(f"Agent chose move (thinking time: {thinking_time:.2f}s): {move}")
                 
-                # Send move to server
-                if self.make_move(move):
+                # Send move to server with measured thinking_time for accurate clocks
+                if self.make_move(move, thinking_time):
                     logger.info("Move sent successfully")
                 else:
                     logger.error("Failed to send move")
@@ -412,11 +425,18 @@ def main():
     parser.add_argument("player", choices=["circle", "square"], help="Player side")
     parser.add_argument("port", type=int, help="Server port (8181 for circle, 8182 for square)")
     parser.add_argument("--server", default="localhost", help="Server host (default: localhost)")
-    parser.add_argument("--strategy", default="random", choices=["random", "student", "student_cpp", "greedy_river"],
-                       help="Bot strategy (default: random)")
+    parser.add_argument("--strategy", default="random", 
+                       choices=["random", "student", "student_cpp", "greedy_river", 
+                               "ta_bot_aggressive", "ta_bot_neutral", "ta_bot_defensive", "custom"],
+                       help="Bot strategy (default: random). TA bots: ta_bot_aggressive/neutral/defensive. Use 'custom' with --custom-agent-path")
+    parser.add_argument("--custom-agent-path", type=str, help="Path to custom agent.py file (required when --strategy custom)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
     
     args = parser.parse_args()
+    
+    # Validate custom agent path if using custom strategy
+    if args.strategy == "custom" and not args.custom_agent_path:
+        parser.error("--custom-agent-path is required when using --strategy custom")
     
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -430,7 +450,7 @@ def main():
         logger.warning(f"Warning: {args.player} player typically uses port {expected_port}, but using {args.port}")
     
     # Create and run bot
-    bot = BotClient(args.player, server_url, args.strategy)
+    bot = BotClient(args.player, server_url, args.strategy, args.custom_agent_path)
     
     print(f"""
 🤖 Starting {args.strategy} bot for {args.player} player

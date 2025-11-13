@@ -476,8 +476,8 @@
             // Update board
             updateBoard();
             
-            // Show winner if game finished
-            if (gameState.winner) {
+            // Show winner if game finished (including draws/stalemates)
+            if (gameState.game_status === 'finished') {
                 showWinner();
             }
         }
@@ -568,11 +568,12 @@
             
             let content = '';
             
-            if (winner === 'tie' || circleScore === squareScore) {
-                // It's a tie
+            // Check for stalemate/draw (winner is null/None or scores are equal)
+            if (winner === null || winner === 'tie' || circleScore === squareScore) {
+                // It's a tie/draw/stalemate
                 content = `
-                    <h2>🤝 It's a Tie! 🤝</h2>
-                    <p style="font-size: 1.1em; margin: 10px 0;">Both players scored equally!</p>
+                    <h2>🤝 It's a Draw! 🤝</h2>
+                    <p style="font-size: 1.1em; margin: 10px 0;">Game ended in a draw - both players scored equally!</p>
                     <div style="display: flex; justify-content: center; gap: 30px; margin-top: 15px;">
                         <div>
                             <p style="font-size: 1.3em; font-weight: bold;">🔴 Circle</p>
@@ -585,7 +586,7 @@
                         </div>
                     </div>
                 `;
-                addLogEntry(`Game finished in a TIE! Both players scored ${circleScore.toFixed(1)} points`);
+                addLogEntry(`Game finished in a DRAW! Both players scored ${circleScore.toFixed(1)} points`);
             } else {
                 // There's a winner
                 let winnerSymbol = winner === 'circle' ? '🔴' : '🔵';

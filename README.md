@@ -77,3 +77,10 @@ python3 client_server/web_server.py 1235
 make cmake-rebuild && python3 client_server/bot_client.py circle 1235 --strategy student_cpp
 
 cd duplicate_folder && make cmake-rebuild && python3 client_server/bot_client.py square 1235 --strategy student_cpp
+
+python3 client_server/bot_client.py square 1235 --strategy greedy_river
+
+
+make cmake-rebuild && python3 client_server/bot_client.py square 1235 --strategy student_cpp
+
+python3 client_server/bot_client.py circle 1235 --strategy ta_bot_aggressive

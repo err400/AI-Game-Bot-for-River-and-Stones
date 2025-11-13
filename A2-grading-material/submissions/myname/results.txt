@@ -1,0 +1,5 @@
+Student: myname
+Submission Type: cpp
+Successful Simulations: 6/6
+Results saved in: sims.txt
+Errors logged in: logs.txt
