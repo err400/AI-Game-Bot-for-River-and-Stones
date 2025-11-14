@@ -1728,9 +1728,9 @@ public:
         }
 
         // Adaptive time allocation by board size (simple heuristic)
-        double base_iter_time = 0.35; // increased from 0.10
-        if(G_ROWS>=15) base_iter_time = 0.45; // increased from 0.14
-        if(G_ROWS>=17) base_iter_time = 0.55; // increased from 0.18
+        double base_iter_time = 0.25; // increased from 0.10
+        if(G_ROWS>=15) base_iter_time = 0.35; // increased from 0.14
+        if(G_ROWS>=17) base_iter_time = 0.45; // increased from 0.18
         double time_limit = base_iter_time;
         if(current_player_time < 10) time_limit *= 0.7;  // less aggressive reduction
         else if(current_player_time < 30) time_limit *= 0.85;
