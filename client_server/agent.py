@@ -552,6 +552,587 @@ class RandomAgent(BaseAgent):
         return random.choice(moves)
 
 
+class AggressiveAgent(BaseAgent):
+    """
+    Aggressive minimax agent that prioritizes attacking and advancing toward opponent.
+    """
+    
+    def __init__(self, player: str, depth: int = 1):
+        super().__init__(player)
+        self.depth = depth
+    
+    def choose(self, board: List[List[Any]], rows: int, cols: int, score_cols: List[int], current_player_time: float, opponent_time: float) -> Optional[Dict[str, Any]]:
+        moves = self.generate_all_moves(board, rows, cols, score_cols)
+        if not moves:
+            return None
+        
+        best_move = None
+        best_score = float('-inf')
+        
+        for move in moves:
+            success, new_board = self.simulate_move(board, move, rows, cols, score_cols)
+            if success:
+                score = self.minimax(new_board, self.depth - 1, False, rows, cols, score_cols)
+                if score > best_score:
+                    best_score = score
+                    best_move = move
+        
+        return best_move if best_move else random.choice(moves)
+    
+    def minimax(self, board: List[List[Any]], depth: int, maximizing: bool, rows: int, cols: int, score_cols: List[int]) -> float:
+        if depth == 0:
+            return self.evaluate_board_aggressive(board, rows, cols, score_cols)
+        
+        if maximizing:
+            max_eval = float('-inf')
+            moves = self.generate_all_moves(board, rows, cols, score_cols)
+            for move in moves:
+                success, new_board = self.simulate_move(board, move, rows, cols, score_cols)
+                if success:
+                    eval_score = self.minimax(new_board, depth - 1, False, rows, cols, score_cols)
+                    max_eval = max(max_eval, eval_score)
+            return max_eval
+        else:
+            min_eval = float('inf')
+            # Generate moves for opponent
+            opponent_moves = self.generate_opponent_moves(board, rows, cols, score_cols)
+            for move in opponent_moves:
+                success, new_board = self.simulate_opponent_move(board, move, rows, cols, score_cols)
+                if success:
+                    eval_score = self.minimax(new_board, depth - 1, True, rows, cols, score_cols)
+                    min_eval = min(min_eval, eval_score)
+            return min_eval
+    
+    def evaluate_board_aggressive(self, board: List[List[Any]], rows: int, cols: int, score_cols: List[int]) -> float:
+        """Aggressive evaluation: prioritizes advancing and attacking."""
+        score = 0.0
+        top_row = top_score_row()
+        bottom_row = bottom_score_row(rows)
+        
+        for y in range(rows):
+            for x in range(cols):
+                piece = board[y][x]
+                if not piece:
+                    continue
+                
+                if piece.owner == self.player and piece.side == "stone":
+                    score += 1.0
+                    
+                    # Bonus for stones in own scoring area
+                    if is_own_score_cell(x, y, self.player, rows, cols, score_cols):
+                        score += 15.0
+                    
+                    # Progress weight: how close are we to target scoring squares
+                    if self.player == "circle":
+                        # Circle wants to reach bottom scoring area
+                        if x in score_cols:
+                            # In scoring column - reward being closer to bottom
+                            progress_bonus = (bottom_row - y) * 2.0  # Higher weight for progress
+                            score += max(0, progress_bonus)
+                        else:
+                            # Not in scoring column - small penalty but still reward advancement
+                            score += (rows - y) * 0.1
+                    else:
+                        # Square wants to reach top scoring area
+                        if x in score_cols:
+                            # In scoring column - reward being closer to top
+                            progress_bonus = (y - top_row) * 2.0  # Higher weight for progress
+                            score += max(0, progress_bonus)
+                        else:
+                            # Not in scoring column - small penalty but still reward advancement
+                            score += y * 0.1
+                    
+                    # Attack bonus: reward for attacking opponent pieces
+                    attack_bonus = self._count_attacks(board, x, y, rows, cols, score_cols)
+                    score += attack_bonus * 1.5  # Bonus for each piece we can attack
+                
+                elif piece.owner == self.opponent and piece.side == "stone":
+                    score -= 1.0
+                    
+                    # Penalty if opponent has stones in their scoring area
+                    if is_own_score_cell(x, y, self.opponent, rows, cols, score_cols):
+                        score -= 15.0
+                    
+                    # Progress penalty: penalize opponent getting close to our scoring area
+                    if self.opponent == "circle":
+                        if x in score_cols:
+                            # Opponent in scoring column - high penalty for being close to our goal
+                            progress_penalty = (bottom_row - y) * 1.5
+                            score -= max(0, progress_penalty)
+                        else:
+                            # General advancement penalty
+                            score -= (rows - y) * 0.2
+                    else:
+                        if x in score_cols:
+                            # Opponent in scoring column - high penalty for being close to our goal
+                            progress_penalty = (y - top_row) * 1.5
+                            score -= max(0, progress_penalty)
+                        else:
+                            # General advancement penalty
+                            score -= y * 0.2
+        
+        return score
+    
+    def _count_attacks(self, board: List[List[Any]], x: int, y: int, rows: int, cols: int, score_cols: List[int]) -> int:
+        """Count how many opponent pieces this stone can attack."""
+        attack_count = 0
+        directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+        
+        for dx, dy in directions:
+            # Check for direct attack (adjacent opponent piece)
+            nx, ny = x + dx, y + dy
+            if in_bounds(nx, ny, rows, cols):
+                target = board[ny][nx]
+                if (target and 
+                    target.owner == self.opponent and 
+                    target.side == "stone"):
+                    attack_count += 1
+            
+            # Check for push attack (opponent piece 2 steps away with clear path)
+            px, py = x + 2*dx, y + 2*dy
+            if in_bounds(px, py, rows, cols):
+                target = board[py][px]
+                if (target and 
+                    target.owner == self.opponent and 
+                    target.side == "stone" and
+                    board[ny][nx] is None):  # Clear path for push
+                    attack_count += 1
+        
+        return attack_count
+    
+    def generate_opponent_moves(self, board: List[List[Any]], rows: int, cols: int, score_cols: List[int]) -> List[Dict[str, Any]]:
+        """Generate moves for the opponent player."""
+        moves = []
+        directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+        
+        for y in range(rows):
+            for x in range(cols):
+                piece = board[y][x]
+                if not piece or piece.owner != self.opponent:
+                    continue
+                
+                if piece.side == "stone":
+                    for dx, dy in directions:
+                        nx, ny = x + dx, y + dy
+                        if not in_bounds(nx, ny, rows, cols):
+                            continue
+                        
+                        if is_opponent_score_cell(nx, ny, self.opponent, rows, cols, score_cols):
+                            continue
+                        
+                        if board[ny][nx] is None:
+                            moves.append({"action": "move", "from": [x, y], "to": [nx, ny]})
+                        else:
+                            if board[ny][nx].owner != self.opponent:
+                                px, py = nx + dx, ny + dy
+                                if (in_bounds(px, py, rows, cols) and 
+                                    board[py][px] is None and 
+                                    not is_opponent_score_cell(px, py, self.opponent, rows, cols, score_cols)):
+                                    moves.append({"action": "push", "from": [x, y], "to": [nx, ny], "pushed_to": [px, py]})
+                    
+                    for orientation in ("horizontal", "vertical"):
+                        temp = copy.deepcopy(board)
+                        temp[y][x].side = "river"
+                        temp[y][x].orientation = orientation
+                        flow = agent_river_flow(temp, x, y, x, y, self.opponent, rows, cols, score_cols)
+                        
+                        if not any(is_opponent_score_cell(dx, dy, self.opponent, rows, cols, score_cols) for dx, dy in flow):
+                            moves.append({"action": "flip", "from": [x, y], "orientation": orientation})
+                
+                else:
+                    moves.append({"action": "flip", "from": [x, y]})
+                    
+                    new_orientation = "vertical" if piece.orientation == "horizontal" else "horizontal"
+                    temp = copy.deepcopy(board)
+                    temp[y][x].orientation = new_orientation
+                    flow = agent_river_flow(temp, x, y, x, y, self.opponent, rows, cols, score_cols)
+                    
+                    if not any(is_opponent_score_cell(dx, dy, self.opponent, rows, cols, score_cols) for dx, dy in flow):
+                        moves.append({"action": "rotate", "from": [x, y]})
+        
+        return moves
+    
+    def simulate_opponent_move(self, board: List[List[Any]], move: Dict[str, Any], rows: int, cols: int, score_cols: List[int]) -> Tuple[bool, Any]:
+        """Simulate an opponent move on a copy of the board."""
+        board_copy = copy.deepcopy(board)
+        success, message = agent_apply_move(board_copy, move, self.opponent, rows, cols, score_cols)
+        
+        if success:
+            return True, board_copy
+        else:
+            return False, message
+
+
+class NeutralAgent(BaseAgent):
+    """
+    Neutral minimax agent with balanced evaluation function.
+    """
+    
+    def __init__(self, player: str, depth: int = 1):
+        super().__init__(player)
+        self.depth = depth
+    
+    def choose(self, board: List[List[Any]], rows: int, cols: int, score_cols: List[int], current_player_time: float, opponent_time: float) -> Optional[Dict[str, Any]]:
+        moves = self.generate_all_moves(board, rows, cols, score_cols)
+        if not moves:
+            return None
+        
+        best_move = None
+        best_score = float('-inf')
+        
+        for move in moves:
+            success, new_board = self.simulate_move(board, move, rows, cols, score_cols)
+            if success:
+                score = self.minimax(new_board, self.depth - 1, False, rows, cols, score_cols)
+                if score > best_score:
+                    best_score = score
+                    best_move = move
+        
+        return best_move if best_move else random.choice(moves)
+    
+    def minimax(self, board: List[List[Any]], depth: int, maximizing: bool, rows: int, cols: int, score_cols: List[int]) -> float:
+        if depth == 0:
+            return self.evaluate_board_neutral(board, rows, cols, score_cols)
+        
+        if maximizing:
+            max_eval = float('-inf')
+            moves = self.generate_all_moves(board, rows, cols, score_cols)
+            for move in moves:
+                success, new_board = self.simulate_move(board, move, rows, cols, score_cols)
+                if success:
+                    eval_score = self.minimax(new_board, depth - 1, False, rows, cols, score_cols)
+                    max_eval = max(max_eval, eval_score)
+            return max_eval
+        else:
+            min_eval = float('inf')
+            opponent_moves = self.generate_opponent_moves(board, rows, cols, score_cols)
+            for move in opponent_moves:
+                success, new_board = self.simulate_opponent_move(board, move, rows, cols, score_cols)
+                if success:
+                    eval_score = self.minimax(new_board, depth - 1, True, rows, cols, score_cols)
+                    min_eval = min(min_eval, eval_score)
+            return min_eval
+    
+    def evaluate_board_neutral(self, board: List[List[Any]], rows: int, cols: int, score_cols: List[int]) -> float:
+        """Neutral evaluation: balanced approach."""
+        score = 0.0
+        top_row = top_score_row()
+        bottom_row = bottom_score_row(rows)
+        
+        for y in range(rows):
+            for x in range(cols):
+                piece = board[y][x]
+                if not piece:
+                    continue
+                
+                if piece.owner == self.player and piece.side == "stone":
+                    score += 1.0
+                    
+                    # Bonus for stones in own scoring area
+                    if is_own_score_cell(x, y, self.player, rows, cols, score_cols):
+                        score += 12.0
+                    
+                    # Progress weight: moderate advancement toward opponent
+                    if self.player == "circle":
+                        score += (rows - y) * 0.2
+                    else:
+                        score += y * 0.2
+                    
+                    # Bonus for controlling center
+                    center_x = cols // 2
+                    center_y = rows // 2
+                    distance_from_center = abs(x - center_x) + abs(y - center_y)
+                    score += max(0, 3 - distance_from_center) * 0.3
+                    
+                    # Progress toward scoring area (similar to aggressive but more moderate)
+                    if self.player == "circle":
+                        if x in score_cols:
+                            # In scoring column - reward being closer to bottom
+                            progress_bonus = (bottom_row - y) * 1.0  # Moderate progress weight
+                            score += max(0, progress_bonus)
+                    else:
+                        if x in score_cols:
+                            # In scoring column - reward being closer to top
+                            progress_bonus = (y - top_row) * 1.0  # Moderate progress weight
+                            score += max(0, progress_bonus)
+                
+                elif piece.owner == self.opponent and piece.side == "stone":
+                    score -= 1.0
+                    
+                    # Penalty if opponent has stones in their scoring area
+                    if is_own_score_cell(x, y, self.opponent, rows, cols, score_cols):
+                        score -= 12.0
+                    
+                    # Moderate penalty for opponent advancing
+                    if self.opponent == "circle":
+                        score -= (rows - y) * 0.15
+                    else:
+                        score -= y * 0.15
+        
+        return score
+    
+    def generate_opponent_moves(self, board: List[List[Any]], rows: int, cols: int, score_cols: List[int]) -> List[Dict[str, Any]]:
+        """Generate moves for the opponent player."""
+        moves = []
+        directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+        
+        for y in range(rows):
+            for x in range(cols):
+                piece = board[y][x]
+                if not piece or piece.owner != self.opponent:
+                    continue
+                
+                if piece.side == "stone":
+                    for dx, dy in directions:
+                        nx, ny = x + dx, y + dy
+                        if not in_bounds(nx, ny, rows, cols):
+                            continue
+                        
+                        if is_opponent_score_cell(nx, ny, self.opponent, rows, cols, score_cols):
+                            continue
+                        
+                        if board[ny][nx] is None:
+                            moves.append({"action": "move", "from": [x, y], "to": [nx, ny]})
+                        else:
+                            if board[ny][nx].owner != self.opponent:
+                                px, py = nx + dx, ny + dy
+                                if (in_bounds(px, py, rows, cols) and 
+                                    board[py][px] is None and 
+                                    not is_opponent_score_cell(px, py, self.opponent, rows, cols, score_cols)):
+                                    moves.append({"action": "push", "from": [x, y], "to": [nx, ny], "pushed_to": [px, py]})
+                    
+                    for orientation in ("horizontal", "vertical"):
+                        temp = copy.deepcopy(board)
+                        temp[y][x].side = "river"
+                        temp[y][x].orientation = orientation
+                        flow = agent_river_flow(temp, x, y, x, y, self.opponent, rows, cols, score_cols)
+                        
+                        if not any(is_opponent_score_cell(dx, dy, self.opponent, rows, cols, score_cols) for dx, dy in flow):
+                            moves.append({"action": "flip", "from": [x, y], "orientation": orientation})
+                
+                else:
+                    moves.append({"action": "flip", "from": [x, y]})
+                    
+                    new_orientation = "vertical" if piece.orientation == "horizontal" else "horizontal"
+                    temp = copy.deepcopy(board)
+                    temp[y][x].orientation = new_orientation
+                    flow = agent_river_flow(temp, x, y, x, y, self.opponent, rows, cols, score_cols)
+                    
+                    if not any(is_opponent_score_cell(dx, dy, self.opponent, rows, cols, score_cols) for dx, dy in flow):
+                        moves.append({"action": "rotate", "from": [x, y]})
+        
+        return moves
+    
+    def simulate_opponent_move(self, board: List[List[Any]], move: Dict[str, Any], rows: int, cols: int, score_cols: List[int]) -> Tuple[bool, Any]:
+        """Simulate an opponent move on a copy of the board."""
+        board_copy = copy.deepcopy(board)
+        success, message = agent_apply_move(board_copy, move, self.opponent, rows, cols, score_cols)
+        
+        if success:
+            return True, board_copy
+        else:
+            return False, message
+
+
+class DefensiveAgent(BaseAgent):
+    """
+    Defensive minimax agent that prioritizes protecting own scoring area and blocking opponent.
+    """
+    
+    def __init__(self, player: str, depth: int = 1):
+        super().__init__(player)
+        self.depth = depth
+    
+    def choose(self, board: List[List[Any]], rows: int, cols: int, score_cols: List[int], current_player_time: float, opponent_time: float) -> Optional[Dict[str, Any]]:
+        moves = self.generate_all_moves(board, rows, cols, score_cols)
+        if not moves:
+            return None
+        
+        best_move = None
+        best_score = float('-inf')
+        
+        for move in moves:
+            success, new_board = self.simulate_move(board, move, rows, cols, score_cols)
+            if success:
+                score = self.minimax(new_board, self.depth - 1, False, rows, cols, score_cols)
+                if score > best_score:
+                    best_score = score
+                    best_move = move
+        
+        return best_move if best_move else random.choice(moves)
+    
+    def minimax(self, board: List[List[Any]], depth: int, maximizing: bool, rows: int, cols: int, score_cols: List[int]) -> float:
+        if depth == 0:
+            return self.evaluate_board_defensive(board, rows, cols, score_cols)
+        
+        if maximizing:
+            max_eval = float('-inf')
+            moves = self.generate_all_moves(board, rows, cols, score_cols)
+            for move in moves:
+                success, new_board = self.simulate_move(board, move, rows, cols, score_cols)
+                if success:
+                    eval_score = self.minimax(new_board, depth - 1, False, rows, cols, score_cols)
+                    max_eval = max(max_eval, eval_score)
+            return max_eval
+        else:
+            min_eval = float('inf')
+            opponent_moves = self.generate_opponent_moves(board, rows, cols, score_cols)
+            for move in opponent_moves:
+                success, new_board = self.simulate_opponent_move(board, move, rows, cols, score_cols)
+                if success:
+                    eval_score = self.minimax(new_board, depth - 1, True, rows, cols, score_cols)
+                    min_eval = min(min_eval, eval_score)
+            return min_eval
+    
+    def evaluate_board_defensive(self, board: List[List[Any]], rows: int, cols: int, score_cols: List[int]) -> float:
+        """Defensive evaluation: prioritizes protecting own area and blocking opponent."""
+        score = 0.0
+        top_row = top_score_row()
+        bottom_row = bottom_score_row(rows)
+        
+        for y in range(rows):
+            for x in range(cols):
+                piece = board[y][x]
+                if not piece:
+                    continue
+                
+                if piece.owner == self.player and piece.side == "stone":
+                    score += 1.0
+                    
+                    # High bonus for stones in own scoring area
+                    if is_own_score_cell(x, y, self.player, rows, cols, score_cols):
+                        score += 20.0
+                    
+                    # Bonus for stones near own scoring area (defensive positioning)
+                    if self.player == "circle":
+                        if y <= top_row + 2:  # Near own scoring area
+                            score += 3.0
+                    else:
+                        if y >= bottom_row - 2:  # Near own scoring area
+                            score += 3.0
+                    
+                    # Small progress weight to prevent oscillation
+                    if self.player == "circle":
+                        score += (rows - y) * 0.05  # Very small advancement bonus
+                    else:
+                        score += y * 0.05
+                    
+                    # Check for direct attack - penalty if opponent can attack this piece
+                    under_attack = self._is_under_direct_attack(board, x, y, rows, cols, score_cols)
+                    if under_attack:
+                        score -= 2.0  # Penalty for being under direct attack
+                
+                elif piece.owner == self.opponent and piece.side == "stone":
+                    score -= 1.0
+                    
+                    # High penalty if opponent has stones in their scoring area
+                    if is_own_score_cell(x, y, self.opponent, rows, cols, score_cols):
+                        score -= 20.0
+                    
+                    # High penalty for opponent stones near our scoring area
+                    if self.player == "circle":
+                        if y <= top_row + 2:  # Near our scoring area
+                            score -= 5.0
+                    else:
+                        if y >= bottom_row - 2:  # Near our scoring area
+                            score -= 5.0
+                    
+                    # Penalty for opponent advancing
+                    if self.opponent == "circle":
+                        score -= (rows - y) * 0.2
+                    else:
+                        score -= y * 0.2
+        
+        return score
+    
+    def _is_under_direct_attack(self, board: List[List[Any]], x: int, y: int, rows: int, cols: int, score_cols: List[int]) -> bool:
+        """Check if a piece at (x, y) is under direct attack from opponent."""
+        directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+        
+        for dx, dy in directions:
+            # Check if opponent piece is adjacent and can attack
+            nx, ny = x + dx, y + dy
+            if in_bounds(nx, ny, rows, cols):
+                opponent_piece = board[ny][nx]
+                if (opponent_piece and 
+                    opponent_piece.owner == self.opponent and 
+                    opponent_piece.side == "stone"):
+                    return True
+            
+            # Check if opponent piece is 2 steps away and can push
+            px, py = x + 2*dx, y + 2*dy
+            if in_bounds(px, py, rows, cols):
+                opponent_piece = board[py][px]
+                if (opponent_piece and 
+                    opponent_piece.owner == self.opponent and 
+                    opponent_piece.side == "stone"):
+                    # Check if there's a clear path for push
+                    if board[ny][nx] is None:  # Empty space between
+                        return True
+        
+        return False
+    
+    def generate_opponent_moves(self, board: List[List[Any]], rows: int, cols: int, score_cols: List[int]) -> List[Dict[str, Any]]:
+        """Generate moves for the opponent player."""
+        moves = []
+        directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+        
+        for y in range(rows):
+            for x in range(cols):
+                piece = board[y][x]
+                if not piece or piece.owner != self.opponent:
+                    continue
+                
+                if piece.side == "stone":
+                    for dx, dy in directions:
+                        nx, ny = x + dx, y + dy
+                        if not in_bounds(nx, ny, rows, cols):
+                            continue
+                        
+                        if is_opponent_score_cell(nx, ny, self.opponent, rows, cols, score_cols):
+                            continue
+                        
+                        if board[ny][nx] is None:
+                            moves.append({"action": "move", "from": [x, y], "to": [nx, ny]})
+                        else:
+                            if board[ny][nx].owner != self.opponent:
+                                px, py = nx + dx, ny + dy
+                                if (in_bounds(px, py, rows, cols) and 
+                                    board[py][px] is None and 
+                                    not is_opponent_score_cell(px, py, self.opponent, rows, cols, score_cols)):
+                                    moves.append({"action": "push", "from": [x, y], "to": [nx, ny], "pushed_to": [px, py]})
+                    
+                    for orientation in ("horizontal", "vertical"):
+                        temp = copy.deepcopy(board)
+                        temp[y][x].side = "river"
+                        temp[y][x].orientation = orientation
+                        flow = agent_river_flow(temp, x, y, x, y, self.opponent, rows, cols, score_cols)
+                        
+                        if not any(is_opponent_score_cell(dx, dy, self.opponent, rows, cols, score_cols) for dx, dy in flow):
+                            moves.append({"action": "flip", "from": [x, y], "orientation": orientation})
+                
+                else:
+                    moves.append({"action": "flip", "from": [x, y]})
+                    
+                    new_orientation = "vertical" if piece.orientation == "horizontal" else "horizontal"
+                    temp = copy.deepcopy(board)
+                    temp[y][x].orientation = new_orientation
+                    flow = agent_river_flow(temp, x, y, x, y, self.opponent, rows, cols, score_cols)
+                    
+                    if not any(is_opponent_score_cell(dx, dy, self.opponent, rows, cols, score_cols) for dx, dy in flow):
+                        moves.append({"action": "rotate", "from": [x, y]})
+        
+        return moves
+    
+    def simulate_opponent_move(self, board: List[List[Any]], move: Dict[str, Any], rows: int, cols: int, score_cols: List[int]) -> Tuple[bool, Any]:
+        """Simulate an opponent move on a copy of the board."""
+        board_copy = copy.deepcopy(board)
+        success, message = agent_apply_move(board_copy, move, self.opponent, rows, cols, score_cols)
+        
+        if success:
+            return True, board_copy
+        else:
+            return False, message
 
 
 # ==================== STUDENT AGENT IMPORT ====================
@@ -570,14 +1151,13 @@ except ImportError:
 
 # ==================== AGENT FACTORY ====================
 
-def get_agent(player: str, strategy: str, custom_agent_path: Optional[str] = None) -> BaseAgent:
+def get_agent(player: str, strategy: str) -> BaseAgent:
     """
     Factory function to create agents based on strategy name.
     
     Args:
         player: "circle" or "square"
-        strategy: Strategy name ("random", "student", "ta_bot_aggressive", "ta_bot_neutral", "ta_bot_defensive", "custom")
-        custom_agent_path: Path to custom agent.py file (used with "custom" strategy)
+        strategy: Strategy name ("random", "student", "ta_bot_aggressive", "ta_bot_neutral", "ta_bot_defensive")
     
     Returns:
         Agent instance
@@ -599,65 +1179,11 @@ def get_agent(player: str, strategy: str, custom_agent_path: Optional[str] = Non
         else:
             print("C++ StudentAgent not available. Falling back to Python StudentAgent.")
             return StudentAgent(player)
-    elif strategy == "greedy_river":
-        try:
-            import greedy_river_agent as greedy
-            Greedy = greedy.StudentAgent
-            return Greedy(player)
-        except Exception as e:
-            print(f"Greedy river agent unavailable ({e}). Falling back to Python StudentAgent.")
-            return StudentAgent(player)
-    elif strategy in ["ta_bot_aggressive", "ta_bot_neutral", "ta_bot_defensive"]:
-        # Load TA bot from A2-grading-material folder
-        import sys
-        import os
-        import importlib.util
-        
-        # Get path to TA bot
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        parent_dir = os.path.dirname(script_dir)
-        ta_agent_path = os.path.join(parent_dir, "A2-grading-material", "agent.py")
-        
-        if not os.path.exists(ta_agent_path):
-            raise FileNotFoundError(f"TA agent not found at: {ta_agent_path}")
-        
-        # Load the module dynamically
-        spec = importlib.util.spec_from_file_location("ta_agent_module", ta_agent_path)
-        ta_module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(ta_module)
-        
-        # Get the appropriate TA agent class
-        if strategy == "ta_bot_aggressive":
-            TAAgent = ta_module.AggressiveAgent
-            print(f"Loaded Aggressive TA bot from: {ta_agent_path}")
-        elif strategy == "ta_bot_neutral":
-            TAAgent = ta_module.NeutralAgent
-            print(f"Loaded Neutral TA bot from: {ta_agent_path}")
-        else:  # ta_bot_defensive
-            TAAgent = ta_module.DefensiveAgent
-            print(f"Loaded Defensive TA bot from: {ta_agent_path}")
-        
-        return TAAgent(player)
-    elif strategy == "custom":
-        # Load custom agent from specified path
-        import sys
-        import os
-        import importlib.util
-        
-        if not custom_agent_path:
-            raise ValueError("custom_agent_path must be provided when using 'custom' strategy")
-        
-        if not os.path.exists(custom_agent_path):
-            raise FileNotFoundError(f"Custom agent not found at: {custom_agent_path}")
-        
-        # Load the module dynamically
-        spec = importlib.util.spec_from_file_location("custom_agent_module", custom_agent_path)
-        custom_module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(custom_module)
-        
-        # Get the StudentAgent class from the custom module
-        CustomAgent = custom_module.StudentAgent
-        print(f"Loaded custom agent from: {custom_agent_path}")
-        return CustomAgent(player)
+    elif strategy == "ta_bot_aggressive":
+        return AggressiveAgent(player)
+    elif strategy == "ta_bot_neutral":
+        return NeutralAgent(player)
+    elif strategy == "ta_bot_defensive":
+        return DefensiveAgent(player)
     else:
-        raise ValueError(f"Unknown strategy: {strategy}. Available: random, student, student_cpp, greedy_river, ta_bot_aggressive, ta_bot_neutral, ta_bot_defensive, custom")
+        raise ValueError(f"Unknown strategy: {strategy}. Available: random, student, ta_bot_aggressive, ta_bot_neutral, ta_bot_defensive")

@@ -1020,6 +1020,9 @@ void explore_river_push(const vector<vector<map<string, string>>>& board,int pus
     // Do not even explore a push chain that would start by moving our own scored stone out
     if(owner_to_be_pushed == pusher_owner && is_own_score_cell_fixed(or_push_row, or_push_col, owner_to_be_pushed)) return;
 
+    // Forbid pushes where the pusher would have to step into the opponent's scoring cell (the current pushed cell)
+    if(is_in_score_area(or_push_row, or_push_col, pusher_owner)) return;
+
     for(auto [dx, dy] : directions){
         int nx = push_row + dx;
         int ny = push_col + dy;
@@ -1120,8 +1123,11 @@ vector<Move>generate_all_moves(const vector<vector<map<string, string>>>& board,
         if(!board[nx][ny].empty() && board[nx][ny].at("side")=="stone"){  
             // Skip invalid destination
             if(nx2 < 0 || nx2 >= rows || ny2 < 0 || ny2 >= cols)continue;
-            // Do NOT push a piece through or into its opponent scoring area
+            // Do NOT push a piece through or into scoring areas
             if(is_in_score_area(nx2, ny2, owner_to_be_pushed))continue;
+            // Engine also forbids pushing a piece into OUR opponent scoring cells
+            // (i.e., the band we cannot enter). Mirror that to avoid proposing illegal pushes.
+            if(is_in_score_area(nx2, ny2, pusher_owner)) continue;
             if(!board[nx2][ny2].empty())continue;
             
             if(is_in_score_area(nx, ny, pusher_owner)) {

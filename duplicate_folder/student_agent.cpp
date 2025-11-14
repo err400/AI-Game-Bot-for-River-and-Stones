@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <iostream>
+#include <iomanip>
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
@@ -94,13 +95,10 @@ struct Move {
     string orientation;
 };
 
-
 vector<Move> generate_all_moves(const vector<vector<map<string, string>>>& board, int row, int col);
 vector<vector<map<string, string>>> update_board(const vector<vector<map<string, string>>>& board, Move move);
 int evaluate_function(const vector<vector<map<string, string>>>& board,const string& owner);
-Move minimax_decision(const vector<vector<map<string, string>>>& board,const string& owner,int max_depth);
-int max_value(const vector<vector<map<string, string>>>& board, string owner,int max_depth,int current_depth,int alpha,int beta);
-int min_value(const vector<vector<map<string, string>>>& board, string owner,int max_depth,int current_depth,int alpha,int beta);
+static inline int scored_delta_after(const vector<vector<map<string, string>>>& board, const Move& mv, const string& side);
 bool is_terminal(const vector<vector<map<string, string>>>& board);
 bool is_in_score_area(int row,int column,string owner);
 // Helper returning true if (row,col) is in OWNER's own scoring area
@@ -111,6 +109,7 @@ static inline bool is_own_score_area(int row,int col,const string& owner){
 // Forward declarations for heuristics used in quick_order_score
 int min_distance_from_scoring_area(const string& owner,int x,int y);
 static inline bool is_own_score_cell_fixed(int row, int col, const string& owner);
+int count_in_score_area(const vector<vector<map<string, string>>>& board,string owner);
 
 // Simple full-position hash for repetition/cycle detection (includes side-to-move)
 static inline uint64_t simple_fullpos_hash(const vector<vector<map<string,string>>>& board, const string& side_to_move){
@@ -147,6 +146,15 @@ static inline uint64_t simple_fullpos_hash(const vector<vector<map<string,string
     // include side to move
     mix((side_to_move=="circle")?0xC1C1C1ull:0x515151ull);
     return h;
+}
+
+// Symmetry-aware hash: vertical mirror around board center
+static inline uint64_t simple_fullpos_hash_mirror(const vector<vector<map<string,string>>>& board, const string& side_to_move){
+    // Compute vertical-mirrored board, reuse your hashing
+    int R=(int)board.size(), C=(int)board[0].size();
+    vector<vector<map<string,string>>> M = board;
+    for(int r=0;r<R;r++) for(int c=0;c<C;c++) M[r][c] = board[r][C-1-c];
+    return simple_fullpos_hash(M, side_to_move);
 }
 
 // Side-agnostic board hash (ignore side to move) to detect repetition/ping-pong
@@ -257,12 +265,30 @@ static int quick_order_score(const vector<vector<map<string,string>>>& board, co
         // pushing opponent away from their goal is good
         string pushed_owner = board[target_r][target_c].at("owner");
         auto md_pushed = [&](int r,int c){ return min_distance_from_scoring_area(pushed_owner, r, c); };
+
         int before = md(fr, fc);
         int after  = md(mv.to[0], mv.to[1]);
         score += (before - after) * (prog_weight/5 + 10);
+
         int before_p = md_pushed(target_r, target_c);
         int after_p  = md_pushed(pr, pc);
-        score += (after_p - before_p) * 8; // hurt opponent more
+        int delta_p  = after_p - before_p;
+
+        if(pushed_owner != mover){
+            // Pushing opponent *away* from their goal is very good
+            score += delta_p * 24;  // was 8, now much stronger
+
+            // Extra bonus if they were already a big threat (close to scoring)
+            if(before_p <= 3 && delta_p > 0){
+                score += 200 * delta_p;
+            }
+        } else {
+            // Pushing our own stone away from our goal is bad
+            if(delta_p > 0){
+                score -= delta_p * 16;
+            }
+        }
+
         if(after >= before) score -= (no_prog_pen/2);
         // prefer pushes that clear our sparser lanes
         int oppb2 = col_blockers(mover, pc);
@@ -382,6 +408,14 @@ static int finish_now_delta(const vector<vector<map<string,string>>>& b,
 static void order_moves(const vector<vector<map<string,string>>>& board,
                         vector<Move>& moves, const Move* hashBest,
                         int ply, const string& side){
+    // Compute center band for opening wing flip bonus
+    // Change #4: use G_SCORE_COLS only for center bounds
+    int C = board.empty()?0:(int)board[0].size();
+    int sc_min = *min_element(G_SCORE_COLS.begin(), G_SCORE_COLS.end());
+    int sc_max = *max_element(G_SCORE_COLS.begin(), G_SCORE_COLS.end());
+    int centerL = max(0, sc_min - 1);
+    int centerR = min(C-1, sc_max + 1);
+    
     vector<ScoredMove> tmp; tmp.reserve(moves.size());
     for(auto &mv: moves){
         int s = 0;
@@ -391,6 +425,15 @@ static void order_moves(const vector<vector<map<string,string>>>& board,
            mv.orientation==hashBest->orientation) s += 500000;
         s += finish_now_delta(board, mv, side);
         s += quick_order_score(board, mv) * 10;
+        
+        // Opening bias: hard-prefer river seeds in the opening
+        int opening_bias = (ply==0 ? 1 : 0);
+        if(opening_bias && mv.action=="flip" && !mv.from.empty()){
+            int fc = mv.from[1];
+            // outer means fc < centerL or fc > centerR
+            if(fc < centerL || fc > centerR) s += 12000;
+        }
+        
         if(ply<MAX_PLY){
             if(mv.action==killer1[ply].action && mv.from==killer1[ply].from &&
                mv.to==killer1[ply].to && mv.pushed_to==killer1[ply].pushed_to) s += 9000;
@@ -463,10 +506,58 @@ static int tactical_quiescence(const vector<vector<map<string,string>>>& board,
     return alpha;
 }
 
+// Global stats for debugging
+static int G_NODES_SEARCHED = 0;
+static int G_ALPHA_CUTOFFS = 0;
+static int G_BETA_CUTOFFS = 0;
+static int G_MAX_DEPTH_REACHED = 0;
+
+// Helper: Detect critical position needing deeper search
+// Returns extension depth (0 = no extension, 1-2 = extend by this much)
+static inline int get_extension_depth(const vector<vector<map<string,string>>>& board,
+                                     const Move& mv, const string& side) {
+    // Check if move directly scores
+    if(mv.action == "move" && !mv.to.empty()) {
+        if(is_own_score_cell_dyn(mv.to[0], mv.to[1], side)) return 2; // scoring move = +2 depth
+    }
+    if(mv.action == "push" && !mv.pushed_to.empty()) {
+        if(is_own_score_cell_dyn(mv.pushed_to[0], mv.pushed_to[1], side)) return 2; // push to score = +2 depth
+    }
+    
+    // Check if opponent can score next move (critical defense needed)
+    string opp = (side == "circle") ? "square" : "circle";
+    int opp_score_row = (opp == "circle") ? top_score_row_dynamic() : bottom_score_row_dynamic();
+    
+    // Count opponent pieces very close to scoring (distance <= 2)
+    int near_threats = 0;
+    for(int i = 0; i < (int)board.size(); i++) {
+        for(int j = 0; j < (int)board[0].size(); j++) {
+            if(board[i][j].empty()) continue;
+            if(board[i][j].at("owner") != opp || board[i][j].at("side") != "stone") continue;
+            int dist = min_distance_from_scoring_area(opp, i, j);
+            if(dist <= 2) near_threats++;
+        }
+    }
+    
+    if(near_threats >= 2) return 1; // multiple threats = +1 depth
+    
+    return 0; // no extension
+}
+
 static int pvs_search(const vector<vector<map<string,string>>>& board,
                       int depth, int ply, int alpha, int beta, const string& side,
                       Move& pv_best)
 {
+    G_NODES_SEARCHED++;
+    if(ply > G_MAX_DEPTH_REACHED) G_MAX_DEPTH_REACHED = ply;
+    
+    // Hard ply limit to prevent runaway selective deepening
+    const int MAX_PLY_LIMIT = 20;
+    if(ply > MAX_PLY_LIMIT) {
+        pv_best = {"",{},{},{}, ""};
+        return evaluate_function(board, side);
+    }
+    
     if(time_up()) { pv_best={"",{},{},{}, ""}; return evaluate_function(board, side); }
     if(depth <= 0){
         pv_best = {"",{},{},{}, ""};
@@ -477,7 +568,10 @@ static int pvs_search(const vector<vector<map<string,string>>>& board,
         return evaluate_function(board, side);
     }
 
-    uint64_t key = simple_fullpos_hash(board, side);
+    // Symmetry-aware hash: use canonical mirror
+    uint64_t h1 = simple_fullpos_hash(board, side);
+    uint64_t h2 = simple_fullpos_hash_mirror(board, side);
+    uint64_t key = std::min(h1, h2);
     Move tt_best{"",{},{},{}, ""};
     int ttv;
     if(tt_probe(key, depth, alpha, beta, ttv, tt_best)){
@@ -496,6 +590,16 @@ static int pvs_search(const vector<vector<map<string,string>>>& board,
     if(moves.empty()){ pv_best={"",{},{},{}, ""}; return evaluate_function(board, side); }
 
     order_moves(board, moves, tt_best.action==""?nullptr:&tt_best, ply, side);
+    
+    // Debug: Check if moves are being ordered (remove after testing)
+    if(ply == 0 && moves.size() > 1) {
+        // Verify first move has highest score
+        int first_score = quick_order_score(board, moves[0]);
+        int second_score = moves.size() > 1 ? quick_order_score(board, moves[1]) : -999999;
+        if(second_score > first_score) {
+            cout << "[WARNING] Move ordering failed at root! Scores: " << first_score << " vs " << second_score << endl;
+        }
+    }
 
     bool first=true;
     Move local_best{"",{},{},{}, ""};
@@ -503,13 +607,18 @@ static int pvs_search(const vector<vector<map<string,string>>>& board,
     int origAlpha = alpha;
 
     for(size_t idx=0; idx<moves.size(); ++idx){
+        if(time_up()) break; // Check time limit inside loop
+        
         const Move &mv = moves[idx];
         auto nb = update_board(board, mv);
 
-        // LMR
-        int rdepth = depth - 1;
-        bool doReduce = (!first && depth>=3 && idx >= 6);
-        if(doReduce) rdepth = depth - 2;
+        // SELECTIVE DEEPENING: Check if this position needs extended search
+        int extension = get_extension_depth(board, mv, side);
+        
+        // LMR (Late Move Reduction)
+        int rdepth = depth - 1 + extension; // base depth + extension
+        bool doReduce = (!first && depth>=3 && idx >= 6 && extension == 0); // don't reduce critical moves
+        if(doReduce) rdepth = depth - 2; // reduce if not critical
 
         Move child_best;
         int score;
@@ -531,6 +640,7 @@ static int pvs_search(const vector<vector<map<string,string>>>& board,
             if(score > alpha){
                 alpha = score;
                 if(alpha >= beta){
+                    G_BETA_CUTOFFS++;
                     if(ply<MAX_PLY){
                         if(!(mv.action==killer1[ply].action && mv.from==killer1[ply].from &&
                              mv.to==killer1[ply].to && mv.pushed_to==killer1[ply].pushed_to)){
@@ -559,6 +669,12 @@ static Move search_root(const vector<vector<map<string,string>>>& board,
     G_TIMEOUT_HIT = false;
     G_DEADLINE = chrono::high_resolution_clock::now() +
                  chrono::milliseconds((int)(time_ms * 1.05));
+    
+    // Reset debug counters
+    G_NODES_SEARCHED = 0;
+    G_ALPHA_CUTOFFS = 0;
+    G_BETA_CUTOFFS = 0;
+    G_MAX_DEPTH_REACHED = 0;
 
     vector<Move> rootMoves;
     int R=board.size(), C=board[0].size();
@@ -569,13 +685,28 @@ static Move search_root(const vector<vector<map<string,string>>>& board,
     }
     if(rootMoves.empty()) return {"move",{0,0},{0,0},{}, ""};
     order_moves(board, rootMoves, nullptr, 0, side);
+    
+    // Debug: Check move ordering quality at root
+    if(rootMoves.size() >= 3) {
+        vector<int> top_scores;
+        for(size_t i = 0; i < min((size_t)5, rootMoves.size()); i++) {
+            top_scores.push_back(quick_order_score(board, rootMoves[i]));
+        }
+        cout << "[MOVE ORDER] Top 5 scores: ";
+        for(int s : top_scores) cout << s << " ";
+        cout << "| Total moves: " << rootMoves.size() << endl;
+    }
 
     int alpha = -1000000000, beta = 1000000000;
     int lastScore = 0;
     Move bestRoot = rootMoves[0];
+    int completed_depth = 0;
+    
+    auto search_start_time = chrono::high_resolution_clock::now();
 
     for(int depth=1; depth<=max_depth_cap && !time_up(); ++depth){
-        int asp = 150;
+        // Wider aspiration window to reduce re-searches (improves effective move ordering)
+        int asp = (depth <= 2) ? 500 : 200;  // very wide for shallow depths
         int a = max(alpha, lastScore - asp);
         int b = min(beta,  lastScore + asp);
 
@@ -592,6 +723,12 @@ static Move search_root(const vector<vector<map<string,string>>>& board,
                 sc = -pvs_search(nb, depth-1, 1, -beta, -alpha,
                                  (side=="circle")?"square":"circle", cb);
             }
+            
+            // Prefer earlier win / later loss (depth bias)
+            int depth_bias = 2*depth;
+            if(sc>0) sc += depth_bias;  // earlier positive is better
+            else     sc -= depth_bias;  // delay negatives
+            
             if(sc > v){
                 v = sc;
                 depthBest = mv;
@@ -601,8 +738,28 @@ static Move search_root(const vector<vector<map<string,string>>>& board,
                 a = max(a, v);
             }
         }
-        if(depthBest.action!=""){ bestRoot = depthBest; lastScore = v; }
+        if(depthBest.action!=""){ bestRoot = depthBest; lastScore = v; completed_depth = depth; }
     }
+    
+    // Calculate actual time used
+    auto search_end_time = chrono::high_resolution_clock::now();
+    double time_used_ms = chrono::duration<double, milli>(search_end_time - search_start_time).count();
+    
+    // Debug output
+    double effective_branching = G_NODES_SEARCHED > 0 ? pow(G_NODES_SEARCHED, 1.0/max(1, completed_depth)) : 0;
+    
+    cout << "\n========================================" << endl;
+    cout << "   SEARCH COMPLETED - DEPTH: " << completed_depth << endl;
+    cout << "========================================" << endl;
+    cout << "[SEARCH STATS] Depth: " << completed_depth 
+         << " | Max Ply: " << G_MAX_DEPTH_REACHED
+         << " | Nodes: " << G_NODES_SEARCHED 
+         << " | Beta Cutoffs: " << G_BETA_CUTOFFS
+         << " | Cutoff Rate: " << (G_NODES_SEARCHED > 0 ? (100.0 * G_BETA_CUTOFFS / G_NODES_SEARCHED) : 0) << "%"
+         << " | Eff. Branching: " << fixed << setprecision(1) << effective_branching
+         << " | Time: " << (int)time_used_ms << "ms/" << time_ms << "ms"
+         << endl;
+    cout << "========================================\n" << endl;
 
     return bestRoot;
 }
@@ -881,6 +1038,9 @@ void explore_river_push(const vector<vector<map<string, string>>>& board,int pus
     // Do not even explore a push chain that would start by moving our own scored stone out
     if(owner_to_be_pushed == pusher_owner && is_own_score_cell_fixed(or_push_row, or_push_col, owner_to_be_pushed)) return;
 
+    // Forbid pushes where the pusher would have to step into the opponent's scoring cell (the current pushed cell)
+    if(is_in_score_area(or_push_row, or_push_col, pusher_owner)) return;
+
     for(auto [dx, dy] : directions){
         int nx = push_row + dx;
         int ny = push_col + dy;
@@ -975,22 +1135,35 @@ vector<Move>generate_all_moves(const vector<vector<map<string, string>>>& board,
         if(board[nx][ny].empty()) continue;
         if(board[nx][ny].at("side")!="stone") continue;
 
-        if(!board[nx][ny].empty() && board[nx][ny].at("side")=="stone"){  
-            string owner_to_be_pushed = board[nx][ny].at("owner");
+        string owner_to_be_pushed = board[nx][ny].at("owner");
+        string pusher_owner = board[row][col].at("owner");
 
+        if(!board[nx][ny].empty() && board[nx][ny].at("side")=="stone"){  
             // Skip invalid destination
             if(nx2 < 0 || nx2 >= rows || ny2 < 0 || ny2 >= cols)continue;
-            // Do NOT push a piece through or into its opponent scoring area
+            // Do NOT push a piece through or into scoring areas
             if(is_in_score_area(nx2, ny2, owner_to_be_pushed))continue;
+            // Engine also forbids pushing a piece into OUR opponent scoring cells
+            // (i.e., the band we cannot enter). Mirror that to avoid proposing illegal pushes.
+            if(is_in_score_area(nx2, ny2, pusher_owner)) continue;
             if(!board[nx2][ny2].empty())continue;
+            
+            if(is_in_score_area(nx, ny, pusher_owner)) {
+                continue;
+            }
+
+            // If we're pushing our own stone that is currently in our scoring area,
+            // forbid moves that would take it OUT of our scoring area.
+            // But allow moves that keep it inside the scoring area.
+            if (owner_to_be_pushed == pusher_owner &&
+                is_own_score_cell_fixed(nx,  ny,  pusher_owner) &&   // currently in own SA
+            !is_own_score_cell_fixed(nx2, ny2, pusher_owner)) {   // destination outside own SA
+                continue;
+            }
 
             //  stone push
             if(board[row][col].at("side") == "stone"){
                 moves.push_back({"push", {row, col}, {nx, ny}, {nx2, ny2}, ""});
-            }
-            // Prevent pushing OUR scored stones out of scoring area
-            if(owner_to_be_pushed == owner && is_own_score_cell_fixed(nx, ny, owner_to_be_pushed)){
-                // skip pushes that would move our already scored stone
             }
             // River pushing a stone
             else if(board[row][col].at("side") == "river"){
@@ -1054,226 +1227,6 @@ bool is_terminal(const vector<vector<map<string, string>>>& board){
     return count_in_score_area(board, "circle")>=need || count_in_score_area(board, "square")>=need;
 }
 
-//applying the minimax function
-int min_value(const vector<vector<map<string, string>>>& board,string owner,int max_depth,int current_depth,int alpha,int beta){
-    // Time or terminal/cutoff checks
-    if(time_up()){
-        // very fast fallback eval to exit quickly
-        string opp = (owner=="circle")?"square":"circle";
-        int val = 3000*(count_in_score_area(board, owner) - count_in_score_area(board, opp));
-        return val;
-    }
-    if(is_terminal(board) || current_depth == max_depth){
-        if(time_up()){
-            string opp = (owner=="circle")?"square":"circle";
-            int val = 3000*(count_in_score_area(board, owner) - count_in_score_area(board, opp));
-            return val;
-        }
-        return evaluate_function(board, owner);
-    }
-    
-    int num_rows = board.size();
-    int num_cols = board[0].size();
-    
-    //getting all oponents moves
-    vector<pair<Move, vector<vector<map<string, string>>>>> all_moves;
-    string opponent = (owner == "circle") ? "square" : "circle";
-    
-    for(int row = 0; row < num_rows; row++){
-        if(time_up()) break;
-        for(int col = 0; col < num_cols; col++){
-            if(time_up()) break;
-            if(!board[row][col].empty() && board[row][col].at("owner") == opponent){
-                vector<Move> current_moves = generate_all_moves(board, row, col);
-                if(current_moves.empty()) continue;
-                
-                for(const auto& move : current_moves){
-                    if(time_up()) break;
-                    vector<vector<map<string, string>>> new_board = update_board(board, move);
-                    if(new_board == board) continue;
-                    
-                    all_moves.push_back({move, new_board});
-                }
-            }
-        }
-    }
-    
-    // If no moves found, return evaluation 
-    if(all_moves.empty()){
-        return evaluate_function(board, owner);
-    }
-    
-    //getting evaluation for each node and doing node ordeering for alpha beta pruning 
-    vector<pair<int, pair<Move, vector<vector<map<string, string>>>>>>ordered_moves;
-
-    //reordering in increasing order since opponent wants to minimize the evaluation fuctnoion 
-    for(const auto& [move, next_board] : all_moves){
-        // Use quick ordering score (from opponent perspective we want lower evaluate_function, but cheaper heuristic first)
-        int h = quick_order_score(board, move); // use current board to avoid eval cost
-        ordered_moves.push_back({h,{move, next_board}});
-    }
-    // Opponent minimizing: sort ascending by heuristic
-    sort(ordered_moves.begin(),ordered_moves.end(),[](const auto& a,const auto& b){return a.first < b.first;});
-    
-    // Standard alpha-beta search with ordered moves
-    int value = 1e9;
-    for(const auto& [score, move_and_board] : ordered_moves){
-        const auto& move = move_and_board.first;
-        const auto& next_board = move_and_board.second;
-        
-        if(time_up()){
-            string opp = (owner=="circle")?"square":"circle";
-            return 3000*(count_in_score_area(board, owner) - count_in_score_area(board, opp));
-        }
-        int new_value = max_value(next_board, owner, max_depth, current_depth + 1, alpha, beta);
-        if(new_value < value){
-            value = new_value;
-        }
-        
-        beta = min(beta, value);
-        if(value <= alpha){
-            return value; // Alpha-beta pruning
-        }
-        if(time_up()) break;
-    }
-    
-    return value;
-}
-
-int max_value(const vector<vector<map<string, string>>>& board,string owner,int max_depth,int current_depth,int alpha,int beta){
-    // Terminal / timeout
-    if(time_up()){
-        string opp = (owner=="circle")?"square":"circle";
-        return 3000*(count_in_score_area(board, owner) - count_in_score_area(board, opp));
-    }
-    if(is_terminal(board) || current_depth == max_depth){
-        if(time_up()){
-            string opp = (owner=="circle")?"square":"circle";
-            return 3000*(count_in_score_area(board, owner) - count_in_score_area(board, opp));
-        }
-        return evaluate_function(board, owner);
-    }
-    
-    int num_rows = board.size();
-    int num_cols = board[0].size();
-    
-    // Collect all our moves
-    vector<pair<Move, vector<vector<map<string, string>>>>>all_moves;
-    
-    for(int row = 0; row < num_rows; row++) {
-        if(time_up()) break;
-        for(int col = 0; col < num_cols; col++) {
-            if(time_up()) break;
-            if(!board[row][col].empty() && board[row][col].at("owner") == owner) {
-                vector<Move> current_moves = generate_all_moves(board, row, col);
-                if(current_moves.empty()) continue;
-                
-                for(const auto& move : current_moves) {
-                    if(time_up()) break;
-                    vector<vector<map<string, string>>> new_board = update_board(board, move);
-                    if(new_board == board) continue;
-                    
-                    all_moves.push_back({move, new_board});
-                }
-            }
-        }
-    }
-    
-    // If no moves found, return evaluation
-    if(all_moves.empty()){
-        return evaluate_function(board, owner);
-    }
-    
-    // Simple move ordering by heuristic value - no pruning
-    vector<pair<int, pair<Move, vector<vector<map<string, string>>>>>>ordered_moves;
-
-    for(const auto& [move, next_board] : all_moves){
-        int h = quick_order_score(board, move);
-        ordered_moves.push_back({h,{move, next_board}});
-    }
-    // Maximizer: sort descending
-    sort(ordered_moves.begin(), ordered_moves.end(),[](const auto& a,const auto& b){return a.first > b.first;});
-    
-    // Standard alpha-beta search with ordered moves
-    int value = -1e9;
-    for(const auto& [score, move_and_board] : ordered_moves){
-        const auto& move = move_and_board.first;
-        const auto& next_board = move_and_board.second;
-        
-        if(time_up()){
-            string opp = (owner=="circle")?"square":"circle";
-            return 3000*(count_in_score_area(board, owner) - count_in_score_area(board, opp));
-        }
-        int new_value = min_value(next_board,owner,max_depth,current_depth + 1,alpha,beta);
-        if(new_value > value){
-            value = new_value;
-        }
-        
-        alpha = max(alpha, value);
-        if(value >= beta){
-            return value; // Alpha-beta pruning
-        }
-        if(time_up()) break;
-    }
-    
-    return value;
-}
-
-//minimax algorithm upto a fixed depth using alpha beta pruning 
-Move minimax_decision(const vector<vector<map<string,string>>>& board,const string& owner,int max_depth){
-    int best_val = -1000000000;
-    Move best_move = {"move",{0,0},{0,0},{},""};
-
-    int alpha = -1000000000;
-    int beta  =  1000000000;
-
-    int num_rows = board.size();
-    int num_cols = board[0].size();
-
-    // Collect all possible moves from all pieces (owner)
-    vector<pair<Move, vector<vector<map<string,string>>>>>all_moves;
-    all_moves.reserve(128);
-    for(int row = 0;row < num_rows;++row){
-        for(int col = 0;col < num_cols;++col){
-            if(board[row][col].empty())continue;
-            if(board[row][col].at("owner") != owner)continue;
-
-            vector<Move>current_moves = generate_all_moves(board, row, col);
-            if(current_moves.empty())continue;
-
-            for(const auto& mv : current_moves){
-                auto new_board = update_board(board,mv);
-                if(new_board == board)continue;
-                all_moves.push_back({mv,std::move(new_board)});
-            }
-        }
-    }
-
-    if(all_moves.empty())return best_move;
-
-    // Cheap heuristic ordering once (avoid expensive evaluate for ordering at root)
-    vector<pair<int,int>> scores; scores.reserve(all_moves.size());
-    for(int i=0;i<(int)all_moves.size();++i){
-        int s = quick_order_score(board, all_moves[i].first);
-        scores.emplace_back(s, i);
-    }
-    sort(scores.begin(), scores.end(),[](const auto &a,const auto &b){
-        return a.first > b.first;});
-
-    for(auto &p : scores){
-        const Move &mv = all_moves[p.second].first;
-        const auto &next_board = all_moves[p.second].second;
-
-        if(time_up()) break;
-        int v = min_value(next_board,owner,max_depth,1,alpha,beta);
-        if(v > best_val){
-            best_val = v;
-            best_move = mv;
-        }
-        alpha = max(alpha, best_val);
-    }
-    return best_move;
-}
 
 //this fucntion is used to check for instant win , to check if after moving a single move if it could win 
 // this is used to help with the blocking move 
@@ -1533,12 +1486,12 @@ public:
         }
 
         // Adaptive time allocation by board size (simple heuristic)
-        double base_iter_time = 0.10; // small board
-        if(G_ROWS>=15) base_iter_time = 0.14; // medium
-        if(G_ROWS>=17) base_iter_time = 0.18; // large
+        double base_iter_time = 0.25; // increased from 0.10
+        if(G_ROWS>=15) base_iter_time = 0.35; // increased from 0.14
+        if(G_ROWS>=17) base_iter_time = 0.45; // increased from 0.18
         double time_limit = base_iter_time;
-        if(current_player_time < 10) time_limit *= 0.5;
-        else if(current_player_time < 30) time_limit *= 0.75;
+        if(current_player_time < 10) time_limit *= 0.7;  // less aggressive reduction
+        else if(current_player_time < 30) time_limit *= 0.85;
 
         // Compute current best manhattan distance for our side (stones only)
         int curr_best_md = 100;
@@ -1703,7 +1656,10 @@ public:
             for(auto &kv : moves_for_current){
                 auto &vec = kv.second;
                 vector<Move> filtered; filtered.reserve(vec.size());
-                for(const auto &mv : vec){ if(!would_repeat_recent(mv)) filtered.push_back(mv); }
+                for (const auto &mv : vec) {
+                    if (scored_delta_after(board, mv, side) > 0) { filtered.push_back(mv); continue; }
+                    if (!would_repeat_recent(mv)) filtered.push_back(mv);
+                }
                 if(!filtered.empty()) vec.swap(filtered); // keep at least one move per piece
             }
             // rebuild flat list
@@ -1733,13 +1689,112 @@ public:
             }
         }
         
+    // ---- Greedy take-the-point: if any move increases scored stones, do it. ----
+    {
+        vector<Move> scoring_moves;
+        scoring_moves.reserve(32);
+        for (auto &kv : moves_for_current) {
+            if (board[kv.first.first][kv.first.second].empty()) continue;
+            if (board[kv.first.first][kv.first.second].at("owner") != side) continue;
+            for (const auto &mv : kv.second) {
+                if (scored_delta_after(board, mv, side) > 0) {
+                    scoring_moves.push_back(mv);
+                }
+            }
+        }
+        if (!scoring_moves.empty()) {
+            // Pick the safest/strongest of the scoring moves by static eval after the move.
+            int best = INT_MIN;
+            Move pick = scoring_moves[0];
+            for (const auto &mv : scoring_moves) {
+                auto nb = update_board(board, mv);
+                int sc  = evaluate_function(nb, side);
+                if (sc > best) { best = sc; pick = mv; }
+            }
+            return convert_move_format(pick);
+        }
+    }
+
+    // ---- Defensive pushes: if we can knock back a near-scoring opponent stone, do it. ----
+    {
+        string opponent = (side == "circle") ? "square" : "circle";
+        vector<Move> defensive_pushes;
+
+        for (const auto &kv : moves_for_current) {
+            int r = kv.first.first;
+            int c = kv.first.second;
+            if (board[r][c].empty() || board[r][c].at("owner") != side) continue;
+
+            for (const auto &mv : kv.second) {
+                if (mv.action != "push" || mv.to.size() < 2 || mv.pushed_to.size() < 2) continue;
+
+                int tr = mv.to[0], tc = mv.to[1];      // stone being pushed
+                if (board[tr][tc].empty() || board[tr][tc].at("owner") != opponent) continue;
+
+                int pr = mv.pushed_to[0], pc = mv.pushed_to[1];
+
+                int before = min_distance_from_scoring_area(opponent, tr, tc);
+                int after  = min_distance_from_scoring_area(opponent, pr, pc);
+                int delta  = after - before;
+
+                // We care only about knocking back real threats
+                if (before <= 3 && delta >= 2) {
+                    defensive_pushes.push_back(mv);
+                }
+            }
+        }
+
+        if (!defensive_pushes.empty()) {
+            // Pick best defensive push by static eval
+            Move pick = defensive_pushes[0];
+            int best = INT_MIN;
+            for (const auto &mv : defensive_pushes) {
+                auto nb = update_board(board, mv);
+                int sc = evaluate_function(nb, side);
+                if (sc > best) { best = sc; pick = mv; }
+            }
+            return convert_move_format(pick);
+        }
+    }
+        
+    // Deterministic symmetry-breaking in openings
+    bool early_game = (position_history.size() <= 4);
+    if(!early_game){
+        // Check if anyone has scored
+        // Change #4: use G_SCORE_COLS only
+        bool anyone_scored = false;
+        int circle_score_row = top_score_row_dynamic();
+        int square_score_row = bottom_score_row_dynamic();
+        for(int c: G_SCORE_COLS){
+            if(!board[circle_score_row][c].empty() && board[circle_score_row][c].at("side")=="stone") anyone_scored=true;
+            if(!board[square_score_row][c].empty() && board[square_score_row][c].at("side")=="stone") anyone_scored=true;
+        }
+        early_game = !anyone_scored;
+    }
+    
+    if(early_game){
+        // Deterministic tie-break: prefer left (smaller column indices)
+        for(auto &kv : moves_for_current){
+            if(kv.second.empty()) continue;
+            stable_sort(kv.second.begin(), kv.second.end(), [&](const Move& a,const Move& b){
+                int ac = a.from.empty()?1000:a.from[1];
+                int bc = b.from.empty()?1000:b.from[1];
+                // prefer smaller 'from' column; if equal, smaller 'to' column
+                if(ac!=bc) return ac < bc;
+                int at = a.to.empty()?1000:a.to[1];
+                int bt = b.to.empty()?1000:b.to[1];
+                return at < bt;
+            });
+        }
+    }
+        
     // ----- PVS root search (time-managed) -----
     size_t est_moves = 0; for(auto &p : moves_for_current) est_moves += p.second.size();
     int time_ms = (int)(time_limit * 1000.0);
-    int max_depth_cap = 5;
-    if(G_ROWS>=15) max_depth_cap = 4;
-    if(G_ROWS>=17) max_depth_cap = 4;
-    if(est_moves > 200) max_depth_cap = min(max_depth_cap, 3);
+    int max_depth_cap = 7;  // increased from 5 to allow deeper search
+    if(G_ROWS>=15) max_depth_cap = 6;  // increased from 4
+    if(G_ROWS>=17) max_depth_cap = 5;  // increased from 4
+    if(est_moves > 250) max_depth_cap = min(max_depth_cap, 4);  // less aggressive reduction
 
     Move best_move = search_root(board, side, time_ms, max_depth_cap);
         
@@ -1830,9 +1885,12 @@ public:
                         int rc = recent_count(hh,10);
                         h += (rc==0?15:(rc==1?5:0));
                         // Lane & piece cooldown penalty to steer away from contested columns/pieces
-                        if(!mv.from.empty() && lane_cooldown.count(mv.from[1])) h -= 800;
-                        if(!mv.to.empty()   && lane_cooldown.count(mv.to[1]))   h -= 500;
-                        if(!mv.from.empty() && piece_cooldown.count(pos_key(mv.from[0], mv.from[1]))) h -= 400;
+                        bool point_gain = (scored_delta_after(board, mv, side) > 0);
+                        if (!point_gain) {
+                            if(!mv.from.empty() && lane_cooldown.count(mv.from[1])) h -= 800;
+                            if(!mv.to.empty()   && lane_cooldown.count(mv.to[1]))   h -= 500;
+                            if(!mv.from.empty() && piece_cooldown.count(pos_key(mv.from[0], mv.from[1]))) h -= 400;
+                        }
                         if(h>bestH){bestH=h; repl=mv;}
                     }
                     best_move = repl;
@@ -1886,9 +1944,12 @@ public:
                         }
                     }
                     // Lane & piece cooldown penalty
-                    if(!mv.from.empty() && lane_cooldown.count(mv.from[1])) h -= 800;
-                    if(!mv.to.empty()   && lane_cooldown.count(mv.to[1]))   h -= 500;
-                    if(!mv.from.empty() && piece_cooldown.count(pos_key(mv.from[0], mv.from[1]))) h -= 400;
+                    bool point_gain = (scored_delta_after(board, mv, side) > 0);
+                    if (!point_gain) {
+                        if(!mv.from.empty() && lane_cooldown.count(mv.from[1])) h -= 800;
+                        if(!mv.to.empty()   && lane_cooldown.count(mv.to[1]))   h -= 500;
+                        if(!mv.from.empty() && piece_cooldown.count(pos_key(mv.from[0], mv.from[1]))) h -= 400;
+                    }
                     // novelty bonus: reward states not seen recently
                     auto nb = update_board(board, mv);
                     uint64_t hsh = simple_board_hash_no_turn(nb);
@@ -2309,6 +2370,18 @@ static void collect_ride_landings_one_move(
     out.erase(unique(out.begin(), out.end()), out.end());
 }
 
+// Returns how many stones in OUR scoring area after mv minus before.
+static inline int scored_delta_after(
+    const vector<vector<map<string,string>>>& B,
+    const Move& mv,
+    const string& side
+){
+    int before = count_in_score_area(B, side);
+    auto nb = update_board(B, mv);
+    int after  = count_in_score_area(nb, side);
+    return after - before;
+}
+
 
 // Return minimal plies (<= ply_cap) for this piece to enter its OWN scoring cell.
 // 999 means "not reachable within cap".
@@ -2359,24 +2432,20 @@ static int min_plies_to_score_piece(
             if(emptyC(B,nr,nc)) push(nr,nc,cost+1);
         }
 
-        // 2) River rides (+1): if any adjacent cell is a *friendly* river (either orientation),
+        // 2) River rides (+1): if any adjacent cell is a river (ours *or* theirs),
         //    collect every reachable landing in ONE move, including river chaining.
-        bool has_friendly_adj=false;
-        vector<pair<int,int>> friends;
+        vector<pair<int,int>> adj_rivers;
         for(int k=0;k<4;k++){
-            int nr=r+d4r[k], nc=c+d4c[k];
+            int nr = r + d4r[k], nc = c + d4c[k];
             if(!inb(nr,nc,R,C)) continue;
-            if(friendlyVert(B,nr,nc,owner) || friendlyHoriz(B,nr,nc,owner)){
-                has_friendly_adj=true; friends.push_back({nr,nc});
-            }
+            if(riverC(B,nr,nc)) adj_rivers.push_back({nr,nc});
         }
-        if(has_friendly_adj){
-            // For each adjacent friendly river, run a bounded river BFS to get all landings
-            for(auto [rr,cc] : friends){
+        if(!adj_rivers.empty()){
+            // For each adjacent river, run a bounded river BFS to get all landings
+            for(auto [rr,cc] : adj_rivers){
                 vector<pair<int,int>> landings;
                 collect_ride_landings_one_move(B, owner, rr, cc, landings, /*node_cap*/48);
                 for(auto [lr,lc] : landings){
-                    // Scanner already avoided opp scoring cells; still double-guard:
                     if(!oppScore(owner,lr,lc)) push(lr,lc,cost+1);
                 }
             }
@@ -2484,6 +2553,100 @@ int evaluate_function(const vector<vector<map<string,string>>>& B, const string&
         corridor_pen  = (int)(excess*scale);
     }
 
+    // 1) DUAL-THREAT PRESSURE: Count distinct columns where stones can score within K plies
+    auto columns_can_score_in = [&](const string& who, int ply_cap){
+        unordered_set<int> cols;
+        for(int r=0;r<R;r++) for(int c=0;c<C;c++){
+            if(stoneC(B,r,c) && B[r][c].at("owner")==who){
+                int t = min_plies_to_score_piece(B, who, r, c, ply_cap, /*exp_node_cap*/150);
+                if(t<=ply_cap){
+                    // If any scoring cell in this column is ours, mark the column.
+                    for(int sc : (G_SCORE_COLS.empty() ? vector<int>{max(0,C/2-2),max(0,C/2-1),min(C-1,C/2),min(C-1,C/2+1)} : G_SCORE_COLS)){
+                        if(c==sc || std::abs(c-sc)<=0) { cols.insert(c); break; }
+                    }
+                }
+            }
+        }
+        return (int)cols.size();
+    };
+
+    int self_cols_le2 = columns_can_score_in(owner, 2);
+    int opp_cols_le2  = columns_can_score_in(opp,    2);
+    int self_cols_le3 = columns_can_score_in(owner, 3);
+    int opp_cols_le3  = columns_can_score_in(opp,   3);
+
+    // 2) RIVER NETWORK BRIDGE SCORE: Connected river components touching back half and near goal
+    auto river_components_bridge_score = [&](const string& who){
+        vector<vector<int>> vis(R, vector<int>(C,0));
+        int goal = (who=="circle")? top_score_row_dynamic() : bottom_score_row_dynamic();
+        int back_min = (who=="circle")? (R/2) : 0;
+        int back_max = (who=="circle")? (R-1) : (R/2);
+        int score=0;
+        for(int r=0;r<R;r++) for(int c=0;c<C;c++){
+            if(vis[r][c]||!riverC(B,r,c)||B[r][c].at("owner")!=who) continue;
+            deque<pair<int,int>> q; q.push_back({r,c}); vis[r][c]=1;
+            bool touches_back=false, near_goal=false, has_vertical=false;
+            while(!q.empty()){
+                auto [x,y]=q.front(); q.pop_front();
+                if(x>=min(back_min,back_max) && x<=max(back_min,back_max)) touches_back=true;
+                if(abs(x-goal)<=2) near_goal=true;
+                if(B[x][y].at("orientation")=="vertical") has_vertical=true;
+                static int d4[4][2]={{1,0},{-1,0},{0,1},{0,-1}};
+                for(auto &d: d4){
+                    int nx=x+d[0], ny=y+d[1];
+                    if(inb(nx,ny,R,C)&&!vis[nx][ny]&&riverC(B,nx,ny)&&B[nx][ny].at("owner")==who){
+                        vis[nx][ny]=1; q.push_back({nx,ny});
+                    }
+                }
+            }
+            if(touches_back && near_goal) score += has_vertical? 9 : 5;
+        }
+        return score;
+    };
+    int net_self = river_components_bridge_score(owner);
+    int net_opp  = river_components_bridge_score(opp);
+
+    // 3) COLUMN RUNWAY: Longest straight sequence of empty/river cells toward goal
+    auto column_runway = [&](const string& who, int col){
+        int start = (who=="circle")? bottom_score_row_dynamic() : top_score_row_dynamic();
+        int goal  = (who=="circle")? top_score_row_dynamic()    : bottom_score_row_dynamic();
+        int step  = (who=="circle")? -1 : +1;
+        int best=0, cur=0;
+        for(int r=start; r!=goal+step; r+=step){
+            if(!inb(r,col,R,C)) break;
+            if(emptyC(B,r,col) || riverC(B,r,col)) { cur++; best=max(best,cur); }
+            else cur=0;
+        }
+        return best;
+    };
+    int best_self_run=0, best_opp_run=0;
+    for(int c=0;c<C;c++){
+        best_self_run=max(best_self_run, column_runway(owner,c));
+        best_opp_run =max(best_opp_run,  column_runway(opp,c));
+    }
+
+    // 4) ANTI-DISLODGE: Penalty if scored stones can be pushed out by opponent
+    auto can_opp_dislodge_scored = [&](){
+        int r_goal = (owner=="circle")? top_score_row_dynamic() : bottom_score_row_dynamic();
+        vector<int> cols = G_SCORE_COLS.empty()? vector<int>{max(0,C/2-2),max(0,C/2-1),min(C-1,C/2),min(C-1,C/2+1)} : G_SCORE_COLS;
+        int risk=0;
+        for(int c: cols){
+            if(inb(r_goal,c,R,C) && stoneC(B,r_goal,c) && B[r_goal][c].at("owner")==owner){
+                static int d4[4][2]={{1,0},{-1,0},{0,1},{0,-1}};
+                for(auto& d: d4){
+                    int pr=r_goal-d[0], pc=c-d[1];
+                    int ep=r_goal+d[0], ec=c+d[1];
+                    if(inb(pr,pc,R,C) && inb(ep,ec,R,C) && stoneC(B,pr,pc) && B[pr][pc].at("owner")==opp && emptyC(B,ep,ec)){
+                        risk++;
+                        break;
+                    }
+                }
+            }
+        }
+        return risk;
+    };
+    int dislodge_risk = can_opp_dislodge_scored();
+
     // ---------------- Weights (tuned to be smooth and search-friendly) ----------------
     const int W_SCORE    = 2200;
 
@@ -2496,6 +2659,13 @@ int evaluate_function(const vector<vector<map<string,string>>>& B, const string&
     const int W_RADJ     = 60;     // small support signal
     const int W_WING     = 180;    // prefer wings if clearly cleaner
     const int W_CORRIDOR = 1;
+    
+    // New weights for advanced features
+    const int W_DUAL2    = 1500;   // dual-threat pressure at ply 2
+    const int W_DUAL3    = 700;    // dual-threat pressure at ply 3
+    const int W_NETWORK  = 80;     // river network bridge score
+    const int W_RUNWAY   = 35;     // column runway advantage
+    const int W_DISLODGE = 900;    // anti-dislodge penalty
 
     long long eval = 0;
 
@@ -2523,6 +2693,36 @@ int evaluate_function(const vector<vector<map<string,string>>>& B, const string&
 
     // Corridor congestion penalty
     eval -= W_CORRIDOR * corridor_pen;
+
+    // Dual-threat/tri-threat pressure (bigger for earlier k)
+    eval += W_DUAL2 * ( (self_cols_le2>=2) - (opp_cols_le2>=2) );
+    eval += W_DUAL3 * ( (self_cols_le3>=2) - (opp_cols_le3>=2) );
+
+    // River network advantage
+    eval += W_NETWORK * (net_self - net_opp);
+
+    // Column runway advantage
+    eval += W_RUNWAY * (best_self_run - best_opp_run);
+
+    // Anti-dislodge penalty
+    eval -= W_DISLODGE * dislodge_risk;
+
+    // Score convexity & urgency (finish faster)
+    if((int)G_SCORE_COLS.size()>=4){
+        if(n_self==3) eval += 1800;
+        if(n_opp==3)  eval -= 1800;
+    }
+
+    // Initiative tilt: earlier plies to score matter more
+    auto init_curve = [&](int t){
+        if(t>=999) return 0;
+        if(t<=1) return 220;
+        if(t==2) return 140;
+        if(t==3) return 70;
+        if(t==4) return 30;
+        return 0;
+    };
+    eval += init_curve(opp_min) - init_curve(self_min);
 
     // Clamp
     if(eval > 2000000000LL) eval = 2000000000LL;
