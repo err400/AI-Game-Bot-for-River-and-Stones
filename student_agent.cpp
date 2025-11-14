@@ -16,6 +16,7 @@
 #include <sstream>
 #include <climits>
 #include <deque>
+#include <cmath>
 using namespace std;
 
 namespace py = pybind11;
@@ -59,6 +60,29 @@ static int G_COLS = 12;
 static vector<int> G_SCORE_COLS; // scoring columns
 // Global knob to push progress when we are stuck across root turns
 static int G_PROGRESS_MODE = 0; // 0=normal, 1=need progress, 2=urgent progress
+
+// Rough estimate of how many turns into the game we are (our moves only).
+// Updated once per choose() using position_history.size().
+static int G_GAME_PLY_ESTIMATE = 0;
+
+struct OpeningLanes {
+    bool initialized = false;
+    int attack_col = -1;   // column where we are happy to build an attack river
+    int defence_col = -1;  // column where we prefer to keep stones as defenders
+};
+
+// We keep separate plans for each owner string.
+static OpeningLanes G_OPENING_CIRCLE;
+static OpeningLanes G_OPENING_SQUARE;
+
+static inline OpeningLanes& opening_for_owner(const string& owner) {
+    return (owner == "circle") ? G_OPENING_CIRCLE : G_OPENING_SQUARE;
+}
+
+// Treat first ~8 of *our* moves as "opening".
+static inline bool in_opening_phase() {
+    return G_GAME_PLY_ESTIMATE < 8;
+}
 
 // Global time control for search (set per choose() call)
 static chrono::high_resolution_clock::time_point G_DEADLINE;
@@ -217,6 +241,29 @@ static int quick_order_score(const vector<vector<map<string,string>>>& board, co
         }
         return cnt;
     };
+
+    auto column_runway_for = [&](const string& who, int col){
+        if(col<0 || col>=(int)board[0].size()) return 0;
+        int R = (int)board.size();
+        int start = (who=="circle") ? bottom_score_row_dynamic()
+                                    : top_score_row_dynamic();
+        int goal  = (who=="circle") ? top_score_row_dynamic()
+                                    : bottom_score_row_dynamic();
+        int step  = (who=="circle") ? -1 : +1;
+        int best = 0, cur = 0;
+        for(int r = start; r != goal + step; r += step){
+            if(r < 0 || r >= R) break;
+            const auto &cell = board[r][col];
+            if(cell.empty() || cell.at("side")=="river"){
+                cur++;
+                if(cur > best) best = cur;
+            } else {
+                cur = 0;
+            }
+        }
+        return best;
+    };
+
     if(mv.action=="move"){
         if(mv.to.size()<2) return 0;
         int tr = mv.to[0], tc = mv.to[1];
@@ -235,9 +282,34 @@ static int quick_order_score(const vector<vector<map<string,string>>>& board, co
                 score += (board[rx][ry].at("orientation")=="vertical"? 14:8);
             }
         }
-        // strongly penalize sliding moves within own scoring area
-        if(board[fr][fc].at("side")=="stone" && is_own_score_cell_fixed(fr,fc,mover) && is_own_score_cell_fixed(tr,tc,mover)){
-            score -= 1500;
+        // strongly penalize *useless* sliding moves inside own scoring area;
+        // but allow (and not penalize) slides that free a vertical river pipeline
+        if(board[fr][fc].at("side") == "stone" &&
+            is_own_score_cell_fixed(fr, fc, mover) &&
+            is_own_score_cell_fixed(tr, tc, mover)){
+
+            bool helpful = false;
+            int score_row = (mover == "circle")
+                                ? top_score_row_dynamic()
+                                : bottom_score_row_dynamic();
+
+            if(fr == score_row){
+                int behind_r = (mover == "circle") ? fr + 1 : fr - 1;
+                if(behind_r >= 0 && behind_r < (int)board.size()){
+                    const auto &behind = board[behind_r][fc];
+                    if(!behind.empty() &&
+                        behind.at("owner") == mover &&
+                        behind.at("side") == "river" &&
+                        behind.at("orientation") == "vertical" &&
+                        tc != fc){ // actually vacate pipeline column
+                        helpful = true;
+                    }
+                }
+            }
+
+            if(!helpful){
+                score -= 1500;
+            }
         }
         // penalize lateral moves that do not reduce distance (avoid cosmetic shuffles)
         if(after >= before) score -= no_prog_pen;
@@ -256,6 +328,18 @@ static int quick_order_score(const vector<vector<map<string,string>>>& board, co
         }
         int dist_from = abs(fc - best_sc), dist_to = abs(tc - best_sc);
         if(dist_to < dist_from) score += 120;
+                // Defensive: if we drop a stone into a long opponent runway column,
+        // treat it as a strong blocking move (like the blue block in your image).
+        string opp = (mover=="circle") ? "square" : "circle";
+        if(board[tr][tc].empty()){
+            int opp_run = column_runway_for(opp, tc);
+            // threshold 5 is tuned for medium/large boards; you can lower to 4
+            // if you want even more paranoid blocking.
+            if(opp_run >= 5){
+                score += 2200;
+            }
+        }
+
         return score;
     }
     if(mv.action=="push"){
@@ -277,6 +361,18 @@ static int quick_order_score(const vector<vector<map<string,string>>>& board, co
         score -= oppb2 * 20;
         int oppb_target_col = col_blockers(mover, target_c);
         if(oppb2 < oppb_target_col) score += (oppb_target_col - oppb2) * 50;
+
+                // Also treat pushes that end with *our* stone sitting in a dangerous
+        // opponent runway column as strong.
+        string opp = (mover=="circle") ? "square" : "circle";
+        if(!mv.to.empty()){
+            int col_to = mv.to[1];
+            int opp_run = column_runway_for(opp, col_to);
+            if(opp_run >= 5){
+                score += 1600;
+            }
+        }
+
         return score;
     }
     if(mv.action=="flip"){
@@ -780,6 +876,111 @@ int min_distance_from_scoring_area(const string& owner,int x,int y){
     return min_dist;
 }
 
+// Choose symmetric attack / defence columns for a given owner,
+// but bias the ATTACK column towards:
+//   - columns with LOW opponent stone density in the game area
+//   - columns near the board corners.
+//
+// We still only choose among scoring-band columns (G_SCORE_COLS or fallback band).
+static void init_opening_lanes_for_owner(
+    const vector<vector<map<string,string>>>& B,
+    const string& owner
+) {
+    OpeningLanes& lanes = opening_for_owner(owner);
+    if (lanes.initialized) return;
+    if (G_COLS <= 0 || B.empty() || B[0].empty()) return;
+
+    int C = G_COLS;
+    int R = (int)B.size();
+
+    // Determine scoring-band columns we are allowed to score on.
+    int sc_min = 0, sc_max = C - 1;
+    vector<int> cand_cols;
+
+    if (!G_SCORE_COLS.empty()) {
+        sc_min = *min_element(G_SCORE_COLS.begin(), G_SCORE_COLS.end());
+        sc_max = *max_element(G_SCORE_COLS.begin(), G_SCORE_COLS.end());
+        cand_cols = G_SCORE_COLS;
+    } else {
+        // Fallback: central band as scoring region by board width.
+        int w = (C <= 12) ? 4 : ((C <= 14) ? 5 : 6);
+        int s = max(0, C/2 - w/2);
+        sc_min = s;
+        sc_max = min(C-1, s + w - 1);
+        for (int c = sc_min; c <= sc_max; ++c) cand_cols.push_back(c);
+    }
+    if (cand_cols.empty()) return;
+
+    string opp = (owner == "circle") ? "square" : "circle";
+
+    // Game area rows: between the two scoring rows (exclusive).
+    int topSR    = top_score_row_dynamic();
+    int bottomSR = bottom_score_row_dynamic();
+    int game_r0  = min(topSR, bottomSR) + 1;
+    int game_r1  = max(topSR, bottomSR) - 1;
+    if (game_r0 < 0)       game_r0 = 0;
+    if (game_r1 >= R)      game_r1 = R - 1;
+    if (game_r0 > game_r1) { game_r0 = 0; game_r1 = R - 1; }
+
+    auto opponent_density = [&](int col){
+        int cnt = 0;
+        for (int r = game_r0; r <= game_r1; ++r) {
+            const auto& cell = B[r][col];
+            if (cell.empty()) continue;
+            if (cell.at("owner") == opp && cell.at("side") == "stone") cnt++;
+        }
+        return cnt;
+    };
+
+    // We want:
+    //   metric = - (big * density) + (small * edge-bonus)
+    // so we strongly avoid dense columns, and among similarly sparse ones
+    // we prefer nearer to the board corners.
+    int best_col = cand_cols[0];
+    int best_metric = INT_MIN;
+
+    for (int col : cand_cols) {
+        int dens = opponent_density(col);
+
+        // Distance to nearest vertical edge.
+        int dist_edge = min(col, C - 1 - col);
+        // Edge bonus: large near edges, small in center.
+        int edge_bonus = (C - 1) - 2 * dist_edge; // e.g., col=0 or C-1 => max
+
+        // Weight density heavily, edge bonus moderately.
+        int metric = -dens * 20 + edge_bonus * 3;
+
+        // Tiny bias to keep ownership's original preference direction:
+        // circle slightly prefers left side, square prefers right side.
+        if (owner == "circle") {
+            metric -= col;           // small pull left
+        } else {
+            metric -= (C - 1 - col); // small pull right
+        }
+
+        if (metric > best_metric) {
+            best_metric = metric;
+            best_col   = col;
+        }
+    }
+
+    lanes.attack_col = best_col;
+
+    // Defence column = scoring column farthest (in columns) from attack column.
+    int def_col = cand_cols[0];
+    int best_def_dist = -1;
+    for (int col : cand_cols) {
+        int d = abs(col - lanes.attack_col);
+        if (d > best_def_dist) {
+            best_def_dist = d;
+            def_col = col;
+        }
+    }
+    lanes.defence_col = def_col;
+
+    lanes.initialized = true;
+}
+
 // Simple position hash for cycle detection: ignore orientation and piece type,
 // only encode occupied cells and their owners. This makes repetition detection
 // robust to cosmetic flips/rotations.
@@ -993,9 +1194,16 @@ void explore_river_move(const vector<vector<map<string, string>>>& board,int x, 
 
 //Explore river paths for PUSH actions
 //here is where using recursive movements we tarverse from river to river and get to all the possible move for that particualr stone or river
-void explore_river_push(const vector<vector<map<string, string>>>& board,int push_row, int push_col, vector<Move>& moves, int rows, int cols,int from_row, int from_col,
-                         set<pair<int,int>>& visited,int or_push_row,int or_push_col, int or_from_row, int or_from_col, int depth){
-
+void explore_river_push(const vector<vector<map<string, string>>>& board,
+                         int push_row, int push_col,
+                         vector<Move>& moves,
+                         int rows, int cols,
+                         int from_row, int from_col,
+                         set<pair<int,int>>& visited,
+                         int or_push_row, int or_push_col,
+                         int or_from_row, int or_from_col,
+                         int depth)
+{
     // Depth and safety caps
     if(depth > 30) return;
     if(push_row < 0 || push_row >= rows || push_col < 0 || push_col >= cols) return;
@@ -1006,7 +1214,7 @@ void explore_river_push(const vector<vector<map<string, string>>>& board,int pus
     visited.insert({push_row, push_col});
     if(visited.size() > 50) return;
 
-    //getting direction
+    // The moving piece (pusher) must be a river at from_row,from_col
     if (board[from_row][from_col].at("side") != "river") return;
     string orientation = board[from_row][from_col].at("orientation");
 
@@ -1014,44 +1222,69 @@ void explore_river_push(const vector<vector<map<string, string>>>& board,int pus
     if (orientation == "horizontal") directions = {{0,1},{0,-1}};
     else directions = {{1,0},{-1,0}};
 
-    
-    string owner_to_be_pushed = board[or_push_row][or_push_col].at("owner");
-    string pusher_owner = board[or_from_row][or_from_col].at("owner");
-    // Do not even explore a push chain that would start by moving our own scored stone out
-    if(owner_to_be_pushed == pusher_owner && is_own_score_cell_fixed(or_push_row, or_push_col, owner_to_be_pushed)) return;
+    string pushed_owner  = board[or_push_row][or_push_col].at("owner");
+    string pusher_owner  = board[or_from_row][or_from_col].at("owner");
 
-    // Forbid pushes where the pusher would have to step into the opponent's scoring cell (the current pushed cell)
+    // Forbid starting a chain where the pusher would have to step into its own forbidden band
+    // (opponent scoring area for pusher_owner).
     if(is_in_score_area(or_push_row, or_push_col, pusher_owner)) return;
 
     for(auto [dx, dy] : directions){
         int nx = push_row + dx;
         int ny = push_col + dy;
         int steps = 0;
+
         while (nx >= 0 && nx < rows && ny >= 0 && ny < cols && steps < 50) {
-            if(nx == from_row && ny == from_col){ 
-                nx += dx; 
-                ny += dy; 
-                continue; 
+            if(nx == from_row && ny == from_col){
+                nx += dx;
+                ny += dy;
+                continue;
             }
 
-            // Do not pass THROUGH the pushed piece's opponent scoring area
-            if (is_in_score_area(nx, ny, owner_to_be_pushed)){
-                break;
-            }
+            // Do not pass THROUGH any opponent scoring area:
+            // - for the piece being pushed (owner-agnostic)
+            // - for the pusher itself (mirrors the simple push rules)
+            if (is_in_score_area(nx, ny, pushed_owner))   break;
+            if (is_in_score_area(nx, ny, pusher_owner))   break;
 
             if(board[nx][ny].empty()){
-                // empty thus a possible move position
-                moves.push_back({"push",{or_from_row, or_from_col},{or_push_row, or_push_col},{nx, ny},""});
-            } 
+                // Candidate final destination for the pushed stone is (nx,ny).
+                // If we are pushing our OWN scored stone, forbid taking it OUT of scoring area.
+                bool pushed_currently_scored = is_own_score_cell_fixed(or_push_row, or_push_col, pushed_owner);
+                bool pushed_dest_scored      = is_own_score_cell_fixed(nx, ny, pushed_owner);
+
+                if (pushed_owner == pusher_owner &&
+                    pushed_currently_scored &&
+                    !pushed_dest_scored) {
+                    // This would drag our scored stone out of our scoring row: skip this target.
+                    // But still allow exploring further along the same direction.
+                } else {
+                    moves.push_back({"push",
+                                     {or_from_row, or_from_col},
+                                     {or_push_row, or_push_col},
+                                     {nx, ny},
+                                     ""});
+                }
+            }
             else if(board[nx][ny].at("side") == "river"){
-                //got river in path now need to tarce path accoirding to that
-                explore_river_push(board, nx, ny, moves, rows, cols, nx, ny, visited,or_push_row,or_push_col, or_from_row, or_from_col, depth+1);
+                // Found another river in the path: continue the chain from there.
+                explore_river_push(board,
+                                   nx, ny,
+                                   moves,
+                                   rows, cols,
+                                   nx, ny,
+                                   visited,
+                                   or_push_row, or_push_col,
+                                   or_from_row, or_from_col,
+                                   depth+1);
                 break;
             }
-            //stone found so break stop
-            else break;
+            else {
+                // Hit a stone (or something else): stop in this direction.
+                break;
+            }
 
-            nx += dx; 
+            nx += dx;
             ny += dy;
             ++steps;
         }
@@ -1094,8 +1327,31 @@ vector<Move>generate_all_moves(const vector<vector<map<string, string>>>& board,
         }
         // avoid sliding inside own scoring area (wasteful)
         if(currently_in_score && target_in_score && side == "stone"){
-            continue;
+            bool helpful = false;
+            int score_row = (owner == "circle")
+                                ? top_score_row_dynamic()
+                                : bottom_score_row_dynamic();
+
+            if(row == score_row){
+                int behind_r = (owner == "circle") ? row + 1 : row - 1;
+                if(behind_r >= 0 && behind_r < rows){
+                    const auto &behind = board[behind_r][col];
+                    if(!behind.empty() &&
+                        behind.at("owner") == owner &&
+                        behind.at("side") == "river" &&
+                        behind.at("orientation") == "vertical" &&
+                        ny != col){ // must actually vacate this column
+                        helpful = true;
+                    }
+                }
+            }
+
+            // if this slide doesn't free a vertical river pipeline, skip it
+            if(!helpful){
+                continue;
+            }
         }
+
         if(board[nx][ny].empty()){
             moves.push_back({"move", {row,col}, {nx,ny}, {}, ""});
         }
@@ -1140,6 +1396,11 @@ vector<Move>generate_all_moves(const vector<vector<map<string, string>>>& board,
             if (owner_to_be_pushed == pusher_owner &&
                 is_own_score_cell_fixed(nx,  ny,  pusher_owner) &&   // currently in own SA
             !is_own_score_cell_fixed(nx2, ny2, pusher_owner)) {   // destination outside own SA
+                continue;
+            }
+
+            if (is_own_score_cell_fixed(row,  col,  pusher_owner) &&   // currently in own SA
+            !is_own_score_cell_fixed(nx, ny, pusher_owner)) {   // destination outside own SA
                 continue;
             }
 
@@ -1196,7 +1457,6 @@ vector<Move>generate_all_moves(const vector<vector<map<string, string>>>& board,
     // Removed previous relaxation: do not allow scored stones to leave their scoring cells
     return moves;
 }
-
 
 //checking if any one of the palyer has one and thus recognizing the terminal node
 bool is_terminal(const vector<vector<map<string, string>>>& board){
@@ -1468,9 +1728,9 @@ public:
         }
 
         // Adaptive time allocation by board size (simple heuristic)
-        double base_iter_time = 0.25; // increased from 0.10
-        if(G_ROWS>=15) base_iter_time = 0.35; // increased from 0.14
-        if(G_ROWS>=17) base_iter_time = 0.45; // increased from 0.18
+        double base_iter_time = 0.35; // increased from 0.10
+        if(G_ROWS>=15) base_iter_time = 0.45; // increased from 0.14
+        if(G_ROWS>=17) base_iter_time = 0.55; // increased from 0.18
         double time_limit = base_iter_time;
         if(current_player_time < 10) time_limit *= 0.7;  // less aggressive reduction
         else if(current_player_time < 30) time_limit *= 0.85;
@@ -1497,6 +1757,10 @@ public:
     uint64_t current_simple_hash = simple_position_hash(board);
     position_history.push_back(current_simple_hash);
     if(position_history.size() > 64) position_history.erase(position_history.begin());
+
+    // Update global estimate of how many of *our* turns have happened
+    // (we only see the board when it's our move).
+    G_GAME_PLY_ESTIMATE = (int)position_history.size();
 
     // it is getting all moves together for the given state of board will help later
         map<pair<int,int>,vector<Move>> moves_for_current;
@@ -2065,6 +2329,53 @@ std::vector<std::vector<std::map<std::string, std::string>>> update_board(const 
 
 // in assigning weights check the values of n_self and n_opp
 
+// Opening heuristic: encourage an attacking river lane and a defending stone lane.
+static int eval_opening_lanes(const vector<vector<map<string,string>>>& B,
+                              const string& owner) {
+    if (!in_opening_phase()) return 0;
+    if (B.empty() || B[0].empty()) return 0;
+
+    init_opening_lanes_for_owner(B, owner);
+    OpeningLanes& lanes = opening_for_owner(owner);
+
+    if (lanes.attack_col < 0 || lanes.attack_col >= (int)B[0].size()) return 0;
+    if (lanes.defence_col < 0 || lanes.defence_col >= (int)B[0].size()) return 0;
+
+    int R = (int)B.size();
+    int score = 0;
+
+    // 1. Reward our rivers in the attack lane (this encourages building a river network there).
+    for (int r = 0; r < R; ++r) {
+        const auto& cell = B[r][lanes.attack_col];
+        if (!cell.empty() &&
+            cell.at("owner") == owner &&
+            cell.at("side")  == "river") {
+            score += 5;   // tuneable
+        }
+    }
+
+    // 2. Reward *stones* (not rivers) remaining in the defence lane.
+    int defenders = 0;
+    for (int r = 0; r < R; ++r) {
+        const auto& cell = B[r][lanes.defence_col];
+        if (!cell.empty() &&
+            cell.at("owner") == owner &&
+            cell.at("side")  == "stone") {
+            defenders++;
+        }
+    }
+
+    // Slight reward per defender.
+    score += defenders * 3;
+
+    // Big penalty if we have completely emptied the defence lane of stones.
+    if (defenders == 0) {
+        score -= 30;     // tuneable – this is what stops converting the last defender
+    }
+
+    return score;
+}
+
 //this is to track the numbe rof path that i can get from my own river moves 
 int river_synergy(const std::vector<std::vector<std::map<std::string, std::string>>>& board, const string& owner,const map<pair<int,int>,vector<Move>>& moves){
     int n = board.size();
@@ -2374,18 +2685,21 @@ static int min_plies_to_score_piece(
 
         // 2) River rides (+1): if any adjacent cell is a *friendly* river (either orientation),
         //    collect every reachable landing in ONE move, including river chaining.
-        bool has_friendly_adj=false;
-        vector<pair<int,int>> friends;
+               // 2) River rides (+1): if any adjacent cell is a river (ours OR opponent's),
+        //    collect every reachable landing in ONE move, including river chaining.
+        bool has_adj_river = false;
+        vector<pair<int,int>> adj_rivers;
         for(int k=0;k<4;k++){
-            int nr=r+d4r[k], nc=c+d4c[k];
+            int nr = r + d4r[k], nc = c + d4c[k];
             if(!inb(nr,nc,R,C)) continue;
-            if(friendlyVert(B,nr,nc,owner) || friendlyHoriz(B,nr,nc,owner)){
-                has_friendly_adj=true; friends.push_back({nr,nc});
+            if(riverC(B,nr,nc)){                 // owner-agnostic: any river is usable
+                has_adj_river = true;
+                adj_rivers.push_back({nr,nc});
             }
         }
-        if(has_friendly_adj){
-            // For each adjacent friendly river, run a bounded river BFS to get all landings
-            for(auto [rr,cc] : friends){
+        if(has_adj_river){
+            // For each adjacent river, run a bounded river BFS to get all landings
+            for(auto [rr,cc] : adj_rivers){
                 vector<pair<int,int>> landings;
                 collect_ride_landings_one_move(B, owner, rr, cc, landings, /*node_cap*/48);
                 for(auto [lr,lc] : landings){
@@ -2394,11 +2708,59 @@ static int min_plies_to_score_piece(
                 }
             }
         }
+
     }
     return 999;
 }
 
 
+// Counts "helper" rivers: our rivers that let the opponent score in ONE move:
+// some opponent stone is adjacent to this river, and from this river a single
+// ride can land in an opponent own scoring cell.
+static int river_assist_threat(const vector<vector<map<string,string>>>& B,
+                               const string& owner)
+{
+    const string opp = (owner=="circle") ? "square" : "circle";
+    const int R = (int)B.size(), C = (int)B[0].size();
+    static const int d4r[4] = {+1,-1,0,0};
+    static const int d4c[4] = {0,0,+1,-1};
+
+    int threats = 0;
+
+    for(int r=0; r<R; ++r){
+        for(int c=0; c<C; ++c){
+            // Only consider OUR rivers
+            if(!riverC(B,r,c)) continue;
+            if(B[r][c].at("owner") != owner) continue;
+
+            // First: can a ride starting from this river reach opp's own scoring area?
+            vector<pair<int,int>> landings;
+            collect_ride_landings_one_move(B, opp, r, c, landings, /*node_cap*/48);
+
+            bool can_score_from_here = false;
+            for(auto &p : landings){
+                if(ownScore(opp, p.first, p.second)){ // opponent's own scoring cell
+                    can_score_from_here = true;
+                    break;
+                }
+            }
+            if(!can_score_from_here) continue;
+
+            // Second: is there any opponent stone adjacent to this river?
+            bool has_adj_opp = false;
+            for(int k=0; k<4; ++k){
+                int sr = r + d4r[k], sc = c + d4c[k];
+                if(!inb(sr,sc,R,C)) continue;
+                if(stoneC(B,sr,sc) && B[sr][sc].at("owner") == opp){
+                    has_adj_opp = true;
+                    break;
+                }
+            }
+            if(has_adj_opp) threats++;
+        }
+    }
+    return threats;
+}
 int evaluate_function(const vector<vector<map<string,string>>>& B, const string& owner){
     const string opp = (owner=="circle") ? "square" : "circle";
     const int R=(int)B.size(), C=(int)B[0].size();
@@ -2504,9 +2866,14 @@ int evaluate_function(const vector<vector<map<string,string>>>& B, const string&
             if(stoneC(B,r,c) && B[r][c].at("owner")==who){
                 int t = min_plies_to_score_piece(B, who, r, c, ply_cap, /*exp_node_cap*/150);
                 if(t<=ply_cap){
-                    // If any scoring cell in this column is ours, mark the column.
-                    for(int sc : (G_SCORE_COLS.empty() ? vector<int>{max(0,C/2-2),max(0,C/2-1),min(C-1,C/2),min(C-1,C/2+1)} : G_SCORE_COLS)){
-                        if(c==sc || std::abs(c-sc)<=0) { cols.insert(c); break; }
+                    // Mark columns that actually reach the scoring band
+                    if(!G_SCORE_COLS.empty()){
+                        for(int sc : G_SCORE_COLS){
+                            if(c==sc){ cols.insert(c); break; }
+                        }
+                    } else {
+                        int mid = C/2;
+                        if(std::abs(c-mid) <= 2) cols.insert(c);
                     }
                 }
             }
@@ -2591,25 +2958,32 @@ int evaluate_function(const vector<vector<map<string,string>>>& B, const string&
     };
     int dislodge_risk = can_opp_dislodge_scored();
 
-    // ---------------- Weights (tuned to be smooth and search-friendly) ----------------
-    const int W_SCORE    = 2200;
+    // ---------------- Weights (balanced attack/defence) ----------------
+    const int W_SCORE    = 2300;
 
-    const int W_LE1      = 1800;
-    const int W_LE2      = 1200;
-    const int W_LE3      = 560;
-    const int W_LE4      = 200;
+    // Fast local threats (symmetric)
+    const int W_LE1      = 2000;
+    const int W_LE2      = 1350;
+    const int W_LE3      = 650;
+    const int W_LE4      = 220;
 
-    const int W_MINPLY   = 320;    // bonus if our best piece needs fewer plies than theirs
-    const int W_RADJ     = 60;     // small support signal
-    const int W_WING     = 180;    // prefer wings if clearly cleaner
+    // Time-to-score differential (ours vs theirs)
+    const int W_MINPLY   = 320;
+
+    const int W_RADJ     = 60;
+    const int W_WING     = 180;
     const int W_CORRIDOR = 1;
     
-    // New weights for advanced features
-    const int W_DUAL2    = 1500;   // dual-threat pressure at ply 2
-    const int W_DUAL3    = 700;    // dual-threat pressure at ply 3
-    const int W_NETWORK  = 80;     // river network bridge score
-    const int W_RUNWAY   = 35;     // column runway advantage
-    const int W_DISLODGE = 900;    // anti-dislodge penalty
+    // Advanced features
+    const int W_DUAL2    = 1300;
+    const int W_DUAL3    = 600;
+    const int W_NETWORK  = 80;
+    const int W_RUNWAY   = 35;
+    const int W_DISLODGE = 800;
+    const int W_RIVER_ASSIST = 1400; // toned down slightly
+
+    // Additional urgency for relative fast threats
+    const int W_URGENCY  = 700;
 
     long long eval = 0;
 
@@ -2622,7 +2996,32 @@ int evaluate_function(const vector<vector<map<string,string>>>& B, const string&
     eval += W_LE3 * (self_le3 - opp_le3);
     eval += W_LE4 * (self_le4 - opp_le4);
 
-    // Best single-piece time-to-score differential
+    // Our rivers that directly give the opponent a 1-move score are bad, but not insane.
+    int assist_threat = river_assist_threat(B, owner);
+    eval -= W_RIVER_ASSIST * assist_threat;
+
+    // Relative urgency: only penalise hard when *they are faster than us*
+    if (opp_min < self_min) {
+        int s_eff = (self_min>=999 ? 5 : min(self_min, 5));
+        int o_eff = (opp_min >=999 ? 5 : min(opp_min, 5));
+        int gap   = max(0, s_eff - o_eff); // how many plies faster they are (capped)
+        int phase = n_self + n_opp;        // late game -> care more
+        int phase_scale = (phase >= 3 ? 1 : 0); // extra kick once scores start happening
+        eval -= W_URGENCY * gap * (1 + phase_scale);
+    }
+
+    // Multiple independent fast threats: mild extra penalties (not nukes)
+    if (opp_le1 + opp_le2 >= 2 && opp_min <= 3) {
+        eval -= 800;
+    }
+    if (opp_cols_le2 >= 2 && opp_min <= 3) {
+        eval -= 900;
+    }
+    if (opp_cols_le3 >= 2 && opp_min <= 3) {
+        eval -= 500;
+    }
+
+    // Best single-piece time-to-score differential (ours vs theirs)
     {
         int s = (self_min>=999? 6 : self_min);
         int o = (opp_min >=999? 6 : opp_min);
@@ -2657,7 +3056,7 @@ int evaluate_function(const vector<vector<map<string,string>>>& B, const string&
         if(n_opp==3)  eval -= 1800;
     }
 
-    // Initiative tilt: earlier plies to score matter more
+    // Initiative tilt: earlier plies to score matter more (small)
     auto init_curve = [&](int t){
         if(t>=999) return 0;
         if(t<=1) return 220;
@@ -2668,11 +3067,15 @@ int evaluate_function(const vector<vector<map<string,string>>>& B, const string&
     };
     eval += init_curve(opp_min) - init_curve(self_min);
 
+    // Opening: attack/defence lanes (only early in the game).
+    eval += eval_opening_lanes(B, owner);
+
     // Clamp
     if(eval > 2000000000LL) eval = 2000000000LL;
     if(eval < -2000000000LL) eval = -2000000000LL;
     return (int)eval;
 }
+
 
 
 // ---- PyBind11 bindings ----
