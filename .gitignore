@@ -1,11 +1,50 @@
+# macOS / editor state
 .DS_Store
 .vscode/
-A5.pdf
-all_theories
+.idea/
+*.swp
+*.swo
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# C/C++ and CMake build artifacts
 build/
+build_greedy/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+Makefile.user
 *.o
+*.a
 *.so
 *.dylib
-__pycache__/
-*.pyc
-build_greedy
+*.dll
+*.pyd
+
+# Generated logs, match data, and trained weights
+logs/*
+!logs/.gitkeep
+models/*
+!models/.gitkeep
+
+# Local reference copies not required at runtime
+all_theories/
+duplicate_folder/
+A2-grading-material/
+
+# Ad-hoc output files from local experiments
+*.log
+*.out
+results.txt
+sims.txt
